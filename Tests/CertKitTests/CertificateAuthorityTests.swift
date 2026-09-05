@@ -52,4 +52,65 @@ struct CertificateAuthorityTests {
             .timeIntervalSince(ca.certificate.notValidBefore) / (365 * 24 * 3600)
         #expect(years > 9.9 && years < 10.1)
     }
+
+    @Test("Chỉ có ca.pem mà thiếu ca.key.pem thì báo lỗi, không ghi đè ca.pem")
+    func throwsWhenOnlyCertificateFileExists() throws {
+        let dir = tempDir()
+        _ = try CertificateAuthority.loadOrCreate(in: dir)
+
+        let certURL = dir.appendingPathComponent("ca.pem")
+        let keyURL = dir.appendingPathComponent("ca.key.pem")
+        try FileManager.default.removeItem(at: keyURL)
+        let certBefore = try String(contentsOf: certURL, encoding: .utf8)
+
+        #expect(throws: CertificateAuthorityError.self) {
+            _ = try CertificateAuthority.loadOrCreate(in: dir)
+        }
+
+        // Bằng chứng thật: ca.pem cũ (mà hệ thống có thể đã trust) không bị đè.
+        let certAfter = try String(contentsOf: certURL, encoding: .utf8)
+        #expect(certAfter == certBefore)
+    }
+
+    @Test("Chỉ có ca.key.pem mà thiếu ca.pem thì báo lỗi, không ghi đè ca.key.pem")
+    func throwsWhenOnlyKeyFileExists() throws {
+        let dir = tempDir()
+        _ = try CertificateAuthority.loadOrCreate(in: dir)
+
+        let certURL = dir.appendingPathComponent("ca.pem")
+        let keyURL = dir.appendingPathComponent("ca.key.pem")
+        try FileManager.default.removeItem(at: certURL)
+        let keyBefore = try String(contentsOf: keyURL, encoding: .utf8)
+
+        #expect(throws: CertificateAuthorityError.self) {
+            _ = try CertificateAuthority.loadOrCreate(in: dir)
+        }
+
+        let keyAfter = try String(contentsOf: keyURL, encoding: .utf8)
+        #expect(keyAfter == keyBefore)
+    }
+
+    @Test("ca.pem và ca.key.pem không khớp nhau thì báo lỗi thay vì trả về CA hỏng")
+    func throwsWhenCertificateAndKeyMismatch() throws {
+        let dirA = tempDir()
+        let dirB = tempDir()
+        _ = try CertificateAuthority.loadOrCreate(in: dirA)
+        _ = try CertificateAuthority.loadOrCreate(in: dirB)
+
+        // Trộn cert của A với key của B: cả hai file đều parse được, nhưng không khớp nhau.
+        let mixedDir = tempDir()
+        try FileManager.default.createDirectory(at: mixedDir, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: dirA.appendingPathComponent("ca.pem"),
+            to: mixedDir.appendingPathComponent("ca.pem")
+        )
+        try FileManager.default.copyItem(
+            at: dirB.appendingPathComponent("ca.key.pem"),
+            to: mixedDir.appendingPathComponent("ca.key.pem")
+        )
+
+        #expect(throws: CertificateAuthorityError.self) {
+            _ = try CertificateAuthority.loadOrCreate(in: mixedDir)
+        }
+    }
 }

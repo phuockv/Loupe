@@ -3,6 +3,32 @@ import Crypto
 import SwiftASN1
 import X509
 
+/// Lỗi khi trạng thái CA trên đĩa không dùng được an toàn.
+public enum CertificateAuthorityError: Error, Sendable {
+    /// Chỉ một trong hai file `ca.pem` / `ca.key.pem` tồn tại. Không tự sinh CA mới ở đây:
+    /// hệ thống có thể đã trust CA cũ trong keychain, sinh mới sẽ âm thầm ghi đè và làm
+    /// mọi kết nối HTTPS bị chặn lỗi TLS mà không rõ lý do.
+    case incompleteOnDiskState(present: String, missing: String)
+
+    /// `ca.key.pem` đọc được nhưng public key của nó không khớp `ca.pem`.
+    case keyDoesNotMatchCertificate
+}
+
+extension CertificateAuthorityError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .incompleteOnDiskState(let present, let missing):
+            return """
+            CA trên đĩa không đầy đủ: có \(present) nhưng thiếu \(missing). \
+            Khôi phục \(missing) từ backup nếu có, hoặc xoá \(present) nếu muốn cố ý sinh CA \
+            mới (và chấp nhận phải trust lại CA mới trong keychain hệ thống).
+            """
+        case .keyDoesNotMatchCertificate:
+            return "ca.key.pem không khớp public key với ca.pem — cặp file CA trên đĩa không hợp lệ."
+        }
+    }
+}
+
 /// Root CA của ứng dụng. Sinh một lần rồi nạp lại từ đĩa các lần sau.
 public struct CertificateAuthority: Sendable {
     public let certificate: Certificate
@@ -21,13 +47,27 @@ public struct CertificateAuthority: Sendable {
         let certURL = directory.appendingPathComponent("ca.pem")
         let keyURL = directory.appendingPathComponent("ca.key.pem")
 
-        if FileManager.default.fileExists(atPath: certURL.path),
-           FileManager.default.fileExists(atPath: keyURL.path) {
+        let certExists = FileManager.default.fileExists(atPath: certURL.path)
+        let keyExists = FileManager.default.fileExists(atPath: keyURL.path)
+
+        if certExists, keyExists {
             let certificate = try Certificate(pemEncoded: String(contentsOf: certURL, encoding: .utf8))
             let key = try P256.Signing.PrivateKey(
                 pemRepresentation: String(contentsOf: keyURL, encoding: .utf8)
             )
+            guard Certificate.PublicKey(key.publicKey) == certificate.publicKey else {
+                throw CertificateAuthorityError.keyDoesNotMatchCertificate
+            }
             return CertificateAuthority(certificate: certificate, signingKey: key)
+        }
+
+        // Chỉ một trong hai file tồn tại: KHÔNG được sinh mới đè lên, vì hệ thống có thể
+        // đã trust file còn lại (ca.pem) trong keychain.
+        if certExists != keyExists {
+            throw CertificateAuthorityError.incompleteOnDiskState(
+                present: certExists ? "ca.pem" : "ca.key.pem",
+                missing: certExists ? "ca.key.pem" : "ca.pem"
+            )
         }
 
         let authority = try generate()

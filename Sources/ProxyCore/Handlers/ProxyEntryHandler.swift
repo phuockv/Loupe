@@ -57,6 +57,26 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
 
     func establishTunnel(context: ChannelHandlerContext, host: String, port: Int) {
         let bypassed = configuration.isBypassed(host: host)
+
+        // MitM một IP trần là bất khả thi chứ không phải chưa làm: leaf cert
+        // mint theo host dùng SAN `dNSName`, còn một IP trần cần SAN
+        // `iPAddress`. Cứ mint bừa thì client từ chối bằng một lỗi TLS khó
+        // đoán; từ chối ở đây cho một câu đọc được kèm lối đi tiếp.
+        //
+        // Chỉ chặn nhánh KHÔNG bypass: tunnel mù không đụng tới certificate
+        // nào cả, nên `CONNECT 10.0.0.5:443` tới một host trong bypass list
+        // vẫn hoàn toàn hợp lệ.
+        //
+        // TRƯỚC `sink(.started)`: một CONNECT bị từ chối thẳng thì không có
+        // phiên nào để ghi lại, và phát `.started` rồi `.failed` ngay sau đó
+        // chỉ làm rác danh sách transaction bằng một thứ chưa từng chạy.
+        if !bypassed, HeaderSanitizer.isIPLiteral(host) {
+            respond(channel: context.channel, status: .badGateway,
+                    message: "MVP chưa MitM được CONNECT tới IP trần (\(host)). "
+                           + "Dùng tên miền, hoặc thêm host này vào bypass list.")
+            return
+        }
+
         // KHÔNG force unwrap: `parseConnectTarget` không kiểm bộ ký tự của
         // host, nên "CONNECT a b:443" vẫn tới được đây và `URL(string:)` trả
         // nil — force unwrap biến một dòng request rác thành crash cả proxy.
@@ -171,10 +191,32 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
     }
 
-    /// Task 8 thay thân hàm này.
+    /// Bàn giao channel cho `MITMUpgradeHandler`, thứ sẽ chờ leaf cert của host
+    /// rồi lắp tầng TLS server và dựng lại stack HTTP bên trên nó.
+    ///
+    /// Được gọi ở ĐÂY — TRƯỚC khi `switchToTunnel` gỡ decoder — là bắt buộc:
+    /// byte client gửi chung một gói với `CONNECT` còn nằm trong buffer của
+    /// decoder, và chúng chỉ tới được `MITMUpgradeHandler` nếu handler đó đã có
+    /// mặt lúc decoder bị gỡ và bắn phần leftover xuống
+    /// (`leftOverBytesStrategy: .forwardBytes`).
+    ///
+    /// Lắp ở `.last`: `self` đã rời pipeline vài dòng trước trong
+    /// `switchToTunnel`, nên `.before(self)` sẽ là một lỗi runtime chứ không
+    /// phải một vị trí. Lúc này decoder là handler duy nhất còn lại phía trên —
+    /// đúng hình dạng mà nhánh bypass (`ConnectTunnelHandler`) cũng dùng.
     func beginMITM(channel: Channel, host: String, port: Int, transactionID: UUID) {
-        sink(.failed(id: transactionID, message: "MitM chưa được hỗ trợ", endedAt: Date()))
-        channel.close(promise: nil)
+        do {
+            try channel.pipeline.syncOperations.addHandler(MITMUpgradeHandler(
+                host: host, port: port, transactionID: transactionID,
+                maxBufferedBytes: configuration.maxInMemoryBodyBytes,
+                configuration: configuration, leafCache: leafCache, sink: sink
+            ))
+        } catch {
+            sink(.failed(id: transactionID,
+                         message: "không lắp được MitM handler: \(error)",
+                         endedAt: Date()))
+            channel.close(promise: nil)
+        }
     }
 
     func respond(channel: Channel, status: HTTPResponseStatus, message: String) {

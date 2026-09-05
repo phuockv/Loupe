@@ -279,6 +279,18 @@ extension GuardedPeer where Part == ByteBuffer {
     /// chiều ra là ngữ nghĩa của TUNNEL. Với một channel HTTP thì nó sai — sau
     /// khi FIN đi rồi ta không còn nói được gì với client nữa, kể cả một lỗi.
     ///
+    /// Kể từ Task 8, ràng buộc đó gánh thêm một việc thứ hai và ĐỪNG NỚI NÓ RA:
+    /// nó là thứ duy nhất giữ cho hàm này không bao giờ chạy trên một channel
+    /// CÓ TLS. `NIOSSLHandler.closeOutput` đặt state `.outputClosed` của chính
+    /// nó ngay ở ĐẦU thủ tục, và từ giây đó `bufferWrite` fail mọi write bằng
+    /// `ChannelError.outputClosed` — với `promise: nil` là byte biến mất im
+    /// lặng. `OutputLiveness` ngồi ở `.first`, tức DƯỚI tầng TLS, nên nó chỉ
+    /// biết chuyện đó khi SOCKET nửa-đóng ở cuối thủ tục shutdown TLS; cả cửa
+    /// sổ giữa hai mốc là mù. Đường MitM vì thế chỉ dùng
+    /// `GuardedPeer<HTTPServerResponsePart>` / `<HTTPClientRequestPart>` cho hai
+    /// channel có TLS của nó, nên hàm này không gọi được ở đó — theo kiểu, chứ
+    /// không theo một quy ước ai đó phải nhớ.
+    ///
     /// `onDrainAbandoned` KHÔNG có giá trị mặc định, cùng lý do với việc `write`
     /// không `@discardableResult`: bỏ cuộc giữa lúc xả là CẮT CỤT, và một lần
     /// cắt cụt không ai kể lại thì transaction vẫn hiện `.tunnelled` sạch sẽ —

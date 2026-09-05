@@ -553,9 +553,22 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
                 do {
                     if target.scheme == .https {
                         var tls = TLSConfiguration.makeClientConfiguration()
+                        // CHỈ http/1.1: ta không cài framing HTTP/2 ở đâu cả,
+                        // nên phải chặn h2 ngay ở ALPN thay vì để origin chọn
+                        // nó rồi gửi về một dòng byte ta không đọc nổi.
                         tls.applicationProtocols = ["http/1.1"]
                         // KHÔNG BAO GIỜ tắt verify ở đây: tắt là biến app
                         // thành lỗ hổng thật cho mọi traffic đi qua nó.
+                        //
+                        // `additionalTrustRoots` là cách ĐÚNG để chạy được với
+                        // một origin tự ký: nó CỘNG THÊM root, system trust
+                        // store giữ nguyên. Mặc định rỗng nên production không
+                        // đổi hành vi một chút nào.
+                        if !configuration.additionalTrustRoots.isEmpty {
+                            tls.additionalTrustRoots = [
+                                .certificates(configuration.additionalTrustRoots)
+                            ]
+                        }
                         let sslContext = try NIOSSLContext(configuration: tls)
                         try channel.pipeline.syncOperations.addHandler(
                             NIOSSLClientHandler(context: sslContext, serverHostname: target.host)

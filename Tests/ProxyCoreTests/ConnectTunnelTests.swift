@@ -875,11 +875,21 @@ struct ConnectTunnelTests {
     }
 
     /// Nhánh KHÔNG bypass đi qua đúng cùng một đoạn gỡ pipeline rồi mới rẽ
-    /// sang `beginMITM`. Task 8 sẽ thay thân hàm đó, nhưng tới lúc ấy thì mọi
-    /// host HTTPS không nằm trong bypass list đều chạy qua đây — nên đường này
-    /// ít nhất phải đóng kết nối gọn gàng thay vì làm sập proxy.
-    @Test("Host ngoài bypass list: vẫn nhận 200 rồi bị đóng, báo .failed, không làm sập proxy")
-    func nonBypassedHostReachesMITMStubWithoutCrashing() async throws {
+    /// sang `beginMITM`, nơi Task 8 lắp tầng TLS. Bài này ghim ĐẦU KIA của
+    /// nhánh đó: client mở tunnel rồi gửi thứ KHÔNG PHẢI TLS, tức mô phỏng đúng
+    /// một app từ chối leaf của proxy (nó bắn alert thay vì tiếp tục bắt tay).
+    ///
+    /// Vẫn dùng socket thô chứ không phải curl: ở đây cần khẳng định NGUYÊN VĂN
+    /// từng byte của response CONNECT, và cần một thất bại bắt tay TẤT ĐỊNH —
+    /// byte đầu tiên `G` (không phải `0x16` của record handshake) làm BoringSSL
+    /// hỏng ngay, không phụ thuộc phiên bản TLS nào được chọn.
+    ///
+    /// Trước Task 8 bài này tên là `nonBypassedHostReachesMITMStubWithoutCrashing`
+    /// và khẳng định stub `beginMITM` đóng kết nối. Stub đó không còn, nên
+    /// khẳng định cũ đã hết nghĩa; thứ được giữ lại là bất biến thật sự của
+    /// nhánh này: client luôn nhận một câu trả lời dứt khoát và proxy không sập.
+    @Test("Host ngoài bypass list: nhận 200, rồi client không nói TLS thì có .failed gợi ý pinning")
+    func nonBypassedHostFailsHandshakeWithPinningHint() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         defer { Task { try? await group.shutdownGracefully() } }
 
@@ -908,18 +918,22 @@ struct ConnectTunnelTests {
 
         let expectedResponse = Self.expectedConnectResponse
         let responseFuture = expect(expectedResponse.utf8.count, from: collector, on: client)
+        // Tên miền chứ không phải IP trần: CONNECT tới IP trần bị chặn bằng 502
+        // TRƯỚC khi tới được nhánh MitM (leaf cần SAN dNSName).
         try await write(Data("""
-        CONNECT 127.0.0.1:\(originPort) HTTP/1.1\r
-        Host: 127.0.0.1:\(originPort)\r
+        CONNECT localhost:\(originPort) HTTP/1.1\r
+        Host: localhost:\(originPort)\r
         \r
 
         """.utf8), to: client)
         let response = try await responseFuture.get()
         #expect(String(decoding: response, as: UTF8.self) == expectedResponse)
 
-        let closed = Task { (try? await client.closeFuture.get()) != nil }
-        #expect(await awaitWithTimeout(closed, seconds: 5) == true,
-                "stub beginMITM phải đóng kết nối, không để client treo")
+        // Không phải ClientHello: BoringSSL phía server hỏng bắt tay ngay.
+        try await write(Data("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".utf8), to: client)
+
+        #expect(try await closes(client, within: .seconds(5)),
+                "bắt tay hỏng thì proxy phải đóng, không để client treo")
 
         let collected = try #require(await awaitWithTimeout(events, seconds: 5))
         let starts = collected.compactMap { event -> Transaction? in
@@ -931,10 +945,12 @@ struct ConnectTunnelTests {
         if case .pending = transaction.state {} else {
             Issue.record("host ngoài bypass list phải .pending, nhận: \(transaction.state)")
         }
-        let failures = collected.compactMap { event -> UUID? in
-            if case .failed(let id, _, _) = event { return id }
+        let failures = collected.compactMap { event -> (UUID, String)? in
+            if case .failed(let id, let message, _) = event { return (id, message) }
             return nil
         }
-        #expect(failures == [transaction.id])
+        #expect(failures.map(\.0) == [transaction.id])
+        #expect(failures.first?.1.contains("pinning") == true,
+                "cần gợi ý bypass list, không phải chuỗi TLS thô: \(failures.first?.1 ?? "-")")
     }
 }

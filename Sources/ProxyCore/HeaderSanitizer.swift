@@ -54,6 +54,26 @@ public enum HeaderSanitizer {
         )
     }
 
+    /// Host là IP literal (v4 hoặc v6) chứ không phải tên miền.
+    ///
+    /// Dùng để TỪ CHỐI MitM: leaf cert mint theo host dùng SAN `dNSName`, mà
+    /// một IP trần cần SAN `iPAddress`. Mint `dNSName: "192.0.2.1"` cho ra một
+    /// cert không client nào chấp nhận, và triệu chứng là một lỗi TLS khó đoán
+    /// thay vì một câu người dùng đọc được.
+    ///
+    /// Cắt `[]` TRƯỚC `inet_pton` là bắt buộc chứ không phải cho gọn:
+    /// `parseConnectTarget` trả host IPv6 ở dạng CÒN NGOẶC (`[2001:db8::1]`),
+    /// mà `inet_pton` không nhận ngoặc — thiếu bước cắt thì mọi CONNECT tới
+    /// IPv6 trần lọt lưới và đi thẳng vào MitM với một leaf vô dụng.
+    public static func isIPLiteral(_ host: String) -> Bool {
+        let trimmed = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        return trimmed.withCString {
+            inet_pton(AF_INET, $0, &v4) == 1 || inet_pton(AF_INET6, $0, &v6) == 1
+        }
+    }
+
     public static func parseConnectTarget(_ target: String) -> (host: String, port: Int)? {
         guard !target.isEmpty else { return nil }
 

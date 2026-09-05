@@ -210,4 +210,88 @@ struct MITMProxyTests {
         #expect(message.contains("pinning"),
                 "byte đi chung gói phải tới được BoringSSL, nhận: \(message)")
     }
+
+    /// Hình dạng PHỔ BIẾN NHẤT với một client thật: một `CONNECT`, một lần bắt
+    /// tay, rồi NHIỀU request nối nhau trên cùng kết nối. Bài e2e ở trên chỉ
+    /// chạy request đầu tiên, nên nó không nói gì về request thứ hai — mà đó
+    /// mới là chỗ dễ hỏng: `HTTPProxyHandler` phải tái dùng đúng kết nối
+    /// upstream (`fixedTarget` là hằng số nên `isUpstreamReusable` luôn khớp),
+    /// và mỗi request phải ra một transaction RIÊNG.
+    @Test("Nhiều request keep-alive trên cùng một tunnel MitM, mỗi cái một transaction")
+    func recordsEveryRequestOnAKeepAliveConnection() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 3)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MITMKeepAlive-\(UUID().uuidString)")
+        let authority = try CertificateAuthority.loadOrCreate(in: dir)
+        let cache = try LeafCertificateCache(authority: authority)
+
+        let origin = try await startTLSOriginServer(
+            group: group, authority: authority, host: "localhost"
+        )
+        defer { try? origin.close().wait() }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = []
+        config.additionalTrustRoots = [
+            try NIOSSLCertificate(bytes: authority.certificateDER(), format: .der)
+        ]
+        let server = ProxyServer(configuration: config, leafCache: cache)
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let collected = Task { () -> [TrafficEvent] in
+            var events: [TrafficEvent] = []
+            var completed = 0
+            for await event in server.events {
+                events.append(event)
+                if case .completed = event {
+                    completed += 1
+                    if completed == 2 { break }
+                }
+                if case .failed = event { break }
+            }
+            return events
+        }
+
+        // Hai URL trong MỘT lần gọi curl: curl tái dùng tunnel, chỉ gửi một
+        // CONNECT và bắt tay đúng một lần.
+        let curl = try runCurl([
+            "-sS", "--cacert", dir.appendingPathComponent("ca.pem").path,
+            "-x", "http://127.0.0.1:\(proxyPort)",
+            "https://localhost:\(originPort)/one",
+            "https://localhost:\(originPort)/two",
+        ])
+        #expect(curl.status == 0)
+        #expect(curl.output == "xin chao tu upstreamxin chao tu upstream")
+
+        guard let events = await awaitEventsWithTimeout(collected, seconds: 15) else {
+            Issue.record("hết giờ chờ hai .completed"); return
+        }
+        let gets = events.compactMap { event -> Transaction? in
+            if case .started(let transaction) = event, transaction.request.method == "GET" {
+                return transaction
+            }
+            return nil
+        }
+        #expect(gets.map(\.request.url.path) == ["/one", "/two"])
+        // Đúng MỘT `.started` cho CONNECT: bắt tay chỉ xảy ra một lần, tunnel
+        // không bị dựng lại giữa chừng.
+        let connects = events.filter { event in
+            if case .started(let transaction) = event { return transaction.request.method == "CONNECT" }
+            return false
+        }
+        #expect(connects.count == 1)
+
+        let completedIDs = events.compactMap { event -> UUID? in
+            if case .completed(let id, let response, _) = event, response.statusCode == 200 {
+                return id
+            }
+            return nil
+        }
+        #expect(completedIDs == gets.map(\.id))
+    }
 }

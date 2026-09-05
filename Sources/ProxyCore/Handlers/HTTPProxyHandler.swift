@@ -201,12 +201,19 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 
     /// Kết nối upstream hiện có (nếu có) còn dùng được cho `target` này
-    /// không: cùng host:port và channel vẫn active. `false` bao gồm cả
-    /// trường hợp chưa từng kết nối (`upstream == nil`).
+    /// không: cùng host:port:scheme và channel vẫn active. `false` bao gồm
+    /// cả trường hợp chưa từng kết nối (`upstream == nil`). So cả `scheme`
+    /// (không chỉ host:port): thiếu nó, `http://h:443` rồi `https://h:443`
+    /// trên cùng client connection sẽ tái dùng nhầm một channel plaintext
+    /// cho request lẽ ra cần TLS. Chưa có đường nào chạm được điều kiện này
+    /// hôm nay (mỗi request tự chọn cổng mặc định theo scheme trừ khi client
+    /// nêu cổng tường minh) và sẽ hết ý nghĩa khi Task 8 dùng `fixedTarget`
+    /// cố định — nhưng đây đúng một điều kiện, và hàm đang được sửa sẵn.
     private func isUpstreamReusable(for target: Target) -> Bool {
         guard let upstream, let upstreamTarget else { return false }
         return upstreamTarget.host == target.host
             && upstreamTarget.port == target.port
+            && upstreamTarget.scheme == target.scheme
             && upstream.isActive
     }
 
@@ -226,15 +233,35 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         pendingUpstreamBytes = 0
     }
 
-    /// Gửi thẳng tới upstream nếu đã kết nối xong; nếu chưa (còn đang async
-    /// connect) thì xếp hàng đợi, giới hạn bởi `maxInMemoryBodyBytes` — vượt
-    /// giới hạn thì huỷ transaction và trả 502 thay vì âm thầm cắt bớt. Với
-    /// backpressure (`pauseClientReads`) đã bật ngay khi bắt đầu connect,
-    /// nhánh vượt giới hạn này chỉ còn là lưới an toàn hiếm khi chạm tới.
+    /// Gửi thẳng tới upstream nếu đã kết nối xong VÀ còn sống; nếu chưa kết
+    /// nối (còn đang async connect) thì xếp hàng đợi, giới hạn bởi
+    /// `maxInMemoryBodyBytes` — vượt giới hạn thì huỷ transaction và trả 502
+    /// thay vì âm thầm cắt bớt. Với backpressure (`pauseClientReads`) đã bật
+    /// ngay khi bắt đầu connect, nhánh vượt giới hạn này chỉ còn là lưới an
+    /// toàn hiếm khi chạm tới.
     private func forwardOrBuffer(_ part: HTTPClientRequestPart, byteCount: Int,
                                  flushImmediately: Bool, context: ChannelHandlerContext) {
         guard !isUpstreamAborted else { return }
         if let upstream {
+            guard upstream.isActive else {
+                // Upstream đã chết giữa lúc ta còn đang forward request
+                // body/end tới nó (origin crash, RST, idle timeout...).
+                // `UpstreamHandler.channelInactive` ĐÃ xử lý xong toàn bộ
+                // hậu quả (rút transaction khỏi `state`, phát `.failed`,
+                // trả 502 hoặc đóng client) TRƯỚC KHI ta có thể nhìn thấy
+                // `isActive == false` ở đây — NIO chuyển `isActive` và bắn
+                // `channelInactive` trong CÙNG một lệnh gọi đồng bộ
+                // (`close0`, không nhường control giữa chừng — xem chú
+                // thích ở `UpstreamHandler.channelInactive`). Nên ở đây chỉ
+                // cần dọn state cục bộ và không ghi vào channel đã chết,
+                // không được phát `.failed`/trả lời client lần hai.
+                discardPendingUpstreamWrites()
+                pendingRequestID = nil
+                collector = nil
+                self.upstream = nil
+                self.upstreamTarget = nil
+                return
+            }
             if flushImmediately {
                 upstream.writeAndFlush(NIOAny(part), promise: nil)
             } else {
@@ -337,9 +364,16 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         // gán body của request 2 vào transaction của request 1.
         guard let collector, let id = pendingRequestID else { return }
         let body = collector.finish()
-        state.transactions[id]?.request.body = body
         self.collector = nil
         self.pendingRequestID = nil
+        // Transaction có thể đã bị UpstreamHandler đánh `.failed` và rút
+        // khỏi `state` (upstream chết giữa lúc body này còn đang forward)
+        // trước khi ta kịp chạy tới đây — đừng phát `.requestBody` cho một
+        // transaction đã hỏng, và đừng ghi body vào một entry không còn tồn
+        // tại (optional chaining bên dưới vốn đã an toàn, nhưng sink thì
+        // không nên chạy).
+        guard state.transactions[id] != nil else { return }
+        state.transactions[id]?.request.body = body
         sink(.requestBody(id: id, body))
     }
 

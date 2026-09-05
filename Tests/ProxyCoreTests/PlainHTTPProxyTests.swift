@@ -89,6 +89,19 @@ final class ChecksumEchoServerHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 }
 
+/// Origin nhận `.head` rồi đóng kết nối NGAY, không bao giờ trả response —
+/// mô phỏng origin chết giữa chừng (crash/RST) một cách TẤT ĐỊNH, để test
+/// đường "upstream chết giữa lúc HTTPProxyHandler còn đang forward request".
+final class DropAfterHeadServerHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        if case .head = unwrapInboundIn(data) {
+            context.close(promise: nil)
+        }
+    }
+}
+
 /// Gom MỘT response HTTP trọn vẹn (head+body+end) qua promise được đăng ký
 /// trước khi gửi request. Dùng trong `RawSequentialClient` để lái đúng MỘT
 /// kết nối TCP tới proxy qua nhiều request tuần tự — thứ URLSession không
@@ -179,6 +192,52 @@ struct RawSequentialClient {
         }
         return try await future.get()
     }
+
+    /// Giống `send`, nhưng gửi `.head` trước rồi đợi `delayBeforeBody` mới
+    /// gửi phần body/end còn lại. Dùng để test đường "upstream chết giữa
+    /// lúc ta còn đang forward request": khoảng nghỉ đủ lớn để FIN từ origin
+    /// (nếu origin đóng ngay khi nhận head, như `DropAfterHeadServerHandler`)
+    /// kịp lan tới proxy và được NIO xử lý xong (channelInactive chạy hết)
+    /// TRƯỚC KHI ta gửi tiếp — biến một race thật (không chắc thắng) thành
+    /// tất định (ta CHỜ cho nó ngã ngũ thay vì đua với nó).
+    func sendWithDelayBeforeBody(
+        host: String, port: Int, path: String, body: Data,
+        delayBeforeBody: Duration, timeout: TimeAmount = .seconds(5)
+    ) async throws -> (status: Int, body: String) {
+        let eventLoop = channel.eventLoop
+        let collector = self.collector
+        let channel = self.channel
+
+        let promise: EventLoopPromise<(status: Int, body: String)> =
+            try await eventLoop.submit { () -> EventLoopPromise<(status: Int, body: String)> in
+                let promise = eventLoop.makePromise(of: (status: Int, body: String).self)
+                collector.pendingPromise = promise
+                var headers = HTTPHeaders()
+                headers.add(name: "Host", value: "\(host):\(port)")
+                headers.add(name: "Content-Length", value: "\(body.count)")
+                let head = HTTPRequestHead(version: .http1_1, method: .POST,
+                                           uri: "http://\(host):\(port)\(path)", headers: headers)
+                channel.writeAndFlush(NIOAny(HTTPClientRequestPart.head(head)), promise: nil)
+                return promise
+            }.get()
+
+        try await Task.sleep(for: delayBeforeBody)
+
+        try await eventLoop.submit {
+            var buffer = channel.allocator.buffer(capacity: body.count)
+            buffer.writeBytes(body)
+            channel.write(NIOAny(HTTPClientRequestPart.body(.byteBuffer(buffer))), promise: nil)
+            channel.writeAndFlush(NIOAny(HTTPClientRequestPart.end(nil)), promise: nil)
+
+            let timeoutTask = eventLoop.scheduleTask(in: timeout) {
+                collector.pendingPromise = nil
+                promise.fail(RawSequentialClientTimeoutError())
+            }
+            promise.futureResult.whenComplete { _ in timeoutTask.cancel() }
+        }.get()
+
+        return try await promise.futureResult.get()
+    }
 }
 
 struct RawSequentialClientTimeoutError: Error, CustomStringConvertible {
@@ -192,6 +251,27 @@ struct PlainHTTPProxyTests {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProxyTests-\(UUID().uuidString)")
         return try LeafCertificateCache(authority: .loadOrCreate(in: dir))
+    }
+
+    /// Đợi `task` tối đa `seconds` giây; hết giờ thì huỷ `task` và trả `nil`.
+    /// Không có hàm này, một hồi quy trong tương lai khiến sự kiện mong đợi
+    /// (ví dụ `.completed`) không bao giờ tới sẽ làm cả bộ test TREO thay vì
+    /// đỏ — đúng bài học đã áp dụng cho `RawSequentialClient.send`, áp dụng
+    /// lại cho việc gom `server.events`.
+    private func awaitWithTimeout<T: Sendable>(
+        _ task: Task<T, Never>, seconds: Double
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            task.cancel()
+            return result
+        }
     }
 
     private func startEchoServer(group: EventLoopGroup) async throws -> Channel {
@@ -248,7 +328,9 @@ struct PlainHTTPProxyTests {
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(String(data: data, encoding: .utf8) == "xin chao tu upstream")
 
-        let events = await collected.value
+        guard let events = await awaitWithTimeout(collected, seconds: 10) else {
+            Issue.record("timeout chờ server.events phát đủ .completed"); return
+        }
         guard case .started(let transaction)? = events.first else {
             Issue.record("thiếu event .started"); return
         }
@@ -350,7 +432,9 @@ struct PlainHTTPProxyTests {
         // requirement 1 của dispatch gốc: .requestBody phải được phát, mang
         // đúng id của transaction và đúng tổng số byte đã gửi — không có nó,
         // UI (Task 10) không bao giờ hiện được body của request.
-        let events = await collected.value
+        guard let events = await awaitWithTimeout(collected, seconds: 10) else {
+            Issue.record("timeout chờ server.events phát đủ .completed"); return
+        }
         guard case .started(let transaction)? = events.first else {
             Issue.record("thiếu event .started"); return
         }
@@ -440,7 +524,9 @@ struct PlainHTTPProxyTests {
         #expect(responseB.status == 200)
         #expect(responseB.body == "count=\(bodyB.count);first=187;last=187;sum=\(sumB)")
 
-        let events = await collected.value
+        guard let events = await awaitWithTimeout(collected, seconds: 10) else {
+            Issue.record("timeout chờ server.events phát đủ hai .completed"); return
+        }
         let failedEvents = events.filter {
             if case .failed = $0 { return true }
             return false
@@ -451,5 +537,72 @@ struct PlainHTTPProxyTests {
             return false
         }.count
         #expect(completedCount == 2)
+    }
+
+    @Test("Upstream chết giữa lúc còn đang forward body: transaction .failed đúng một lần, client nhận 502, không có .requestBody")
+    func upstreamDeathMidRequestFailsCleanly() async throws {
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await originGroup.shutdownGracefully() } }
+
+        // Origin đóng kết nối NGAY khi nhận .head, trước khi trả response —
+        // tái hiện tất định "upstream chết giữa chừng" (không phụ thuộc
+        // timing thật của crash/RST như trên mạng thật).
+        let origin = try await ServerBootstrap(group: originGroup)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(DropAfterHeadServerHandler())
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        defer { try? origin.close().wait() }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        // Thu event tới khi có .failed — không đợi .completed (sẽ không
+        // bao giờ tới ở test này).
+        let collected = Task {
+            var events: [TrafficEvent] = []
+            for await event in server.events {
+                events.append(event)
+                if case .failed = event { break }
+            }
+            return events
+        }
+
+        let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await clientGroup.shutdownGracefully() } }
+        let client = try await RawSequentialClient.connect(group: clientGroup, proxyPort: proxyPort)
+        defer { client.channel.close(promise: nil) }
+
+        // 300ms: rất lớn so với một round-trip loopback — đủ để FIN từ
+        // origin lan tới proxy và UpstreamHandler.channelInactive chạy xong
+        // TRƯỚC KHI ta gửi phần body/end còn lại.
+        let response = try await client.sendWithDelayBeforeBody(
+            host: "127.0.0.1", port: originPort, path: "/x",
+            body: Data(repeating: 0x43, count: 1024),
+            delayBeforeBody: .milliseconds(300)
+        )
+        #expect(response.status == 502)
+
+        guard let events = await awaitWithTimeout(collected, seconds: 10) else {
+            Issue.record("timeout chờ .failed event"); return
+        }
+        let failedCount = events.filter {
+            if case .failed = $0 { return true }
+            return false
+        }.count
+        #expect(failedCount == 1)
+        let requestBodyCount = events.filter {
+            if case .requestBody = $0 { return true }
+            return false
+        }.count
+        #expect(requestBodyCount == 0)
     }
 }

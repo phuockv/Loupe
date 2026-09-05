@@ -56,9 +56,12 @@ public actor ProxyServer {
                 )
                 let entry = ProxyEntryHandler(configuration: configuration,
                                               leafCache: leafCache, sink: sink)
-                entry.httpHandlers = [encoder, decoder]
                 let proxy = HTTPProxyHandler(configuration: configuration,
                                              sink: sink, fixedTarget: nil)
+                // Task 7 gỡ toàn bộ stack HTTP để bàn giao tunnel thô; proxy
+                // (HTTPProxyHandler) phải có mặt ở đây cùng encoder/decoder,
+                // không chỉ hai cái đó — thiếu nó Task 7 không có gì để gỡ.
+                entry.httpHandlers = [encoder, decoder, proxy]
                 // syncOperations thay vì addHandlers(_:) thường: entry/proxy
                 // không Sendable (là ChannelHandler, chỉ ghim event loop),
                 // và addHandlers(_:) thường đòi hỏi Sendable vì có thể nhảy

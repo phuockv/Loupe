@@ -193,6 +193,17 @@ struct PlainHTTPProxyTests {
         ]
         let session = URLSession(configuration: sessionConfig)
 
+        // Thu event ở một task riêng trước khi phát request (cùng pattern
+        // với test GET ở trên).
+        let collected = Task {
+            var events: [TrafficEvent] = []
+            for await event in server.events {
+                events.append(event)
+                if case .completed = event { break }
+            }
+            return events
+        }
+
         // 4 MB: đủ lớn để chắc chắn nhiều chunk .body tới trong lúc connect
         // upstream (chỉ mất một round-trip loopback) còn đang xử lý — đây
         // chính là race khiến bug "im lặng đánh rơi byte" tái hiện tất định.
@@ -210,5 +221,20 @@ struct PlainHTTPProxyTests {
         let (data, response) = try await session.data(for: request)
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(String(data: data, encoding: .utf8) == "bytes=\(bodySize)")
+
+        // requirement 1 của dispatch gốc: .requestBody phải được phát, mang
+        // đúng id của transaction và đúng tổng số byte đã gửi — không có nó,
+        // UI (Task 10) không bao giờ hiện được body của request.
+        let events = await collected.value
+        guard case .started(let transaction)? = events.first else {
+            Issue.record("thiếu event .started"); return
+        }
+        let requestBodyEvents = events.compactMap { event -> (id: UUID, payload: BodyPayload)? in
+            guard case .requestBody(let id, let payload) = event else { return nil }
+            return (id, payload)
+        }
+        #expect(requestBodyEvents.count == 1)
+        #expect(requestBodyEvents.first?.id == transaction.id)
+        #expect(requestBodyEvents.first?.payload.totalBytes == bodySize)
     }
 }

@@ -21,6 +21,10 @@ final class SessionState {
 
     func dequeue() -> Transaction? {
         guard !pendingIDs.isEmpty else { return nil }
-        return transactions[pendingIDs.removeFirst()]
+        // removeValue(forKey:), không phải subscript đọc: chỉ gỡ khỏi
+        // pendingIDs thì transactions không bao giờ được dọn, rò rỉ mỗi
+        // transaction (kèm tới 2 MiB body) suốt vòng đời connection
+        // keep-alive.
+        return transactions.removeValue(forKey: pendingIDs.removeFirst())
     }
 }

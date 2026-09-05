@@ -60,4 +60,48 @@ struct BodyCollectorTests {
         #expect(total == 120)
         #expect(data.count <= 100)
     }
+
+    @Test("Ghi giữa chừng thất bại (đĩa đầy) thì xoá file dở, trả .truncated rỗng nhưng tổng byte đúng")
+    func midStreamWriteFailureDeletesPartialFileAndReturnsEmptyTruncated() {
+        let collector = BodyCollector(limit: 100, spillDirectory: tempDir())
+
+        // Seam nội bộ (internal, chỉ thấy được nhờ @testable): thay handle ghi thật
+        // bằng bản giả. Hai lần ghi đầu (buffer sẵn có + chunk kích hoạt spill) thành
+        // công như bình thường; lần ghi thứ ba (chunk kế tiếp, đã đang spill) mô
+        // phỏng lỗi giữa chừng thật sự, ví dụ đĩa đầy.
+        var capturedURL: URL?
+        var writeCount = 0
+        collector.openWriteHandle = { url in
+            capturedURL = url
+            return BodyCollectorWriteHandle(
+                write: { _ in
+                    writeCount += 1
+                    if writeCount >= 3 {
+                        throw CocoaError(.fileWriteOutOfSpace)
+                    }
+                },
+                close: {}
+            )
+        }
+
+        collector.append(Data(repeating: 0x41, count: 60))   // vào buffer, chưa spill
+        collector.append(Data(repeating: 0x42, count: 60))   // vượt ngưỡng -> startSpilling, 2 lần ghi đầu OK
+        collector.append(Data(repeating: 0x43, count: 10))   // đã đang spill -> write(_:), ghi thứ 3 lỗi
+        // Sau khi đã hỏng, chunk tiếp theo phải chỉ được ĐẾM chứ không được lọt
+        // vào buffer rồi bị trả về như thể là "phần đầu" (nó là phần ĐUÔI thật sự).
+        collector.append(Data(repeating: 0x44, count: 5))
+
+        guard let url = capturedURL else {
+            Issue.record("mong đợi openWriteHandle được gọi"); return
+        }
+        // File dở tạo bởi FileManager.createFile ở startSpilling phải bị xoá,
+        // không được mồ côi lại trên đĩa.
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+
+        guard case .truncated(let data, let total) = collector.finish() else {
+            Issue.record("mong đợi .truncated"); return
+        }
+        #expect(total == 135)
+        #expect(data.isEmpty)   // trung thực là không còn giữ nội dung, không giả làm phần đầu bằng phần đuôi
+    }
 }

@@ -24,7 +24,7 @@ public enum BodyPayload: Sendable {
 
 public struct RequestModel: Sendable {
     public var method: String
-    public var url: URL
+    public let url: URL
     public var httpVersion: String
     /// Mảng cặp chứ không phải Dictionary: HTTP cho phép header lặp
     /// (`Set-Cookie`) và inspector phải hiện đúng thứ tự gốc.

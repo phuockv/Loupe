@@ -115,7 +115,7 @@ public struct Transaction: Identifiable, Sendable {
         port: Int,
         request: RequestModel,
         state: TransactionState = .pending,
-        isTunnelled: Bool = false
+        isTunnelled: Bool
     ) {
         self.id = id
         self.startedAt = startedAt

@@ -491,7 +491,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
             headers: head.headers.map { (name: $0.name, value: $0.value) }
         )
         return Transaction(scheme: target.scheme, host: target.host,
-                           port: target.port, request: request)
+                           port: target.port, request: request, isTunnelled: false)
     }
 
     private func hostHeader(for target: Target) -> String {

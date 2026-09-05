@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOPosix
 import NIOHTTP1
 import TrafficModel
@@ -193,55 +194,47 @@ struct RawSequentialClient {
         return try await future.get()
     }
 
-    /// Giống `send`, nhưng gửi `.head` trước rồi đợi `delayBeforeBody` mới
-    /// gửi phần body/end còn lại. Dùng để test đường "upstream chết giữa
-    /// lúc ta còn đang forward request": khoảng nghỉ đủ lớn để FIN từ origin
-    /// (nếu origin đóng ngay khi nhận head, như `DropAfterHeadServerHandler`)
-    /// kịp lan tới proxy và được NIO xử lý xong (channelInactive chạy hết)
-    /// TRƯỚC KHI ta gửi tiếp — biến một race thật (không chắc thắng) thành
-    /// tất định (ta CHỜ cho nó ngã ngũ thay vì đua với nó).
-    func sendWithDelayBeforeBody(
-        host: String, port: Int, path: String, body: Data,
-        delayBeforeBody: Duration, timeout: TimeAmount = .seconds(5)
-    ) async throws -> (status: Int, body: String) {
-        let eventLoop = channel.eventLoop
-        let collector = self.collector
-        let channel = self.channel
-
-        let promise: EventLoopPromise<(status: Int, body: String)> =
-            try await eventLoop.submit { () -> EventLoopPromise<(status: Int, body: String)> in
-                let promise = eventLoop.makePromise(of: (status: Int, body: String).self)
-                collector.pendingPromise = promise
-                var headers = HTTPHeaders()
-                headers.add(name: "Host", value: "\(host):\(port)")
-                headers.add(name: "Content-Length", value: "\(body.count)")
-                let head = HTTPRequestHead(version: .http1_1, method: .POST,
-                                           uri: "http://\(host):\(port)\(path)", headers: headers)
-                channel.writeAndFlush(NIOAny(HTTPClientRequestPart.head(head)), promise: nil)
-                return promise
-            }.get()
-
-        try await Task.sleep(for: delayBeforeBody)
-
-        try await eventLoop.submit {
-            var buffer = channel.allocator.buffer(capacity: body.count)
-            buffer.writeBytes(body)
-            channel.write(NIOAny(HTTPClientRequestPart.body(.byteBuffer(buffer))), promise: nil)
-            channel.writeAndFlush(NIOAny(HTTPClientRequestPart.end(nil)), promise: nil)
-
-            let timeoutTask = eventLoop.scheduleTask(in: timeout) {
-                collector.pendingPromise = nil
-                promise.fail(RawSequentialClientTimeoutError())
-            }
-            promise.futureResult.whenComplete { _ in timeoutTask.cancel() }
-        }.get()
-
-        return try await promise.futureResult.get()
-    }
 }
 
 struct RawSequentialClientTimeoutError: Error, CustomStringConvertible {
     var description: String { "RawSequentialClient.send timed out waiting for a response" }
+}
+
+/// Thu MỌI `TrafficEvent` mà proxy phát ra (không dừng ở event đầu tiên nào
+/// cả), và tuỳ chọn chạy một hành động đúng lúc `.started` đang được phát.
+///
+/// Thu hết là điểm mấu chốt: một vòng lặp `break` ngay ở `.failed` đầu tiên
+/// thì mệnh đề "chỉ có đúng MỘT `.failed`" không thể sai được, nên nó cũng
+/// không chứng minh được gì.
+///
+/// `onStarted` mô phỏng thứ mà `sink` thật sự là: closure do NGƯỜI GỌI cung
+/// cấp, chạy xen giữa lúc `HTTPProxyHandler` kiểm tra upstream còn sống và
+/// lúc nó thực sự ghi head ra upstream.
+///
+/// `@unchecked Sendable` giống các handler test khác trong file này: mọi
+/// truy cập đều nằm trên đúng một thread — các test dùng lớp này tự lái
+/// `EmbeddedEventLoop` đồng bộ, không có điểm await nào ở giữa.
+final class RecordingSink: @unchecked Sendable {
+    private(set) var events: [TrafficEvent] = []
+    var onStarted: (() -> Void)?
+
+    func record(_ event: TrafficEvent) {
+        events.append(event)
+        if case .started = event { onStarted?() }
+    }
+
+    var startedCount: Int {
+        events.filter { if case .started = $0 { return true }; return false }.count
+    }
+    var completedCount: Int {
+        events.filter { if case .completed = $0 { return true }; return false }.count
+    }
+    var failedCount: Int {
+        events.filter { if case .failed = $0 { return true }; return false }.count
+    }
+    var requestBodyCount: Int {
+        events.filter { if case .requestBody = $0 { return true }; return false }.count
+    }
 }
 
 @Suite("Proxy HTTP plaintext")
@@ -539,8 +532,8 @@ struct PlainHTTPProxyTests {
         #expect(completedCount == 2)
     }
 
-    @Test("Upstream chết giữa lúc còn đang forward body: transaction .failed đúng một lần, client nhận 502, không có .requestBody")
-    func upstreamDeathMidRequestFailsCleanly() async throws {
+    @Test("Origin đóng trước khi trả response: client nhận 502 và .failed mang đúng id transaction")
+    func upstreamDeathBeforeResponseReaches502() async throws {
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         defer { Task { try? await originGroup.shutdownGracefully() } }
 
@@ -581,28 +574,225 @@ struct PlainHTTPProxyTests {
         let client = try await RawSequentialClient.connect(group: clientGroup, proxyPort: proxyPort)
         defer { client.channel.close(promise: nil) }
 
-        // 300ms: rất lớn so với một round-trip loopback — đủ để FIN từ
-        // origin lan tới proxy và UpstreamHandler.channelInactive chạy xong
-        // TRƯỚC KHI ta gửi phần body/end còn lại.
-        let response = try await client.sendWithDelayBeforeBody(
-            host: "127.0.0.1", port: originPort, path: "/x",
-            body: Data(repeating: 0x43, count: 1024),
-            delayBeforeBody: .milliseconds(300)
-        )
+        // Không có sleep nào ở đây: origin đóng ngay khi nhận `.head` và
+        // KHÔNG BAO GIỜ trả response, nên dù proxy có kịp forward hết
+        // body/end trước khi thấy FIN hay không, kết cục vẫn y hệt —
+        // `UpstreamHandler.channelInactive` thấy transaction đang chờ, phát
+        // `.failed` và trả 502. Kết quả tất định theo mọi thứ tự đan xen.
+        let response = try await client.send(host: "127.0.0.1", port: originPort,
+                                             path: "/x",
+                                             body: Data(repeating: 0x43, count: 1024))
         #expect(response.status == 502)
 
         guard let events = await awaitWithTimeout(collected, seconds: 10) else {
             Issue.record("timeout chờ .failed event"); return
         }
-        let failedCount = events.filter {
-            if case .failed = $0 { return true }
-            return false
-        }.count
-        #expect(failedCount == 1)
-        let requestBodyCount = events.filter {
-            if case .requestBody = $0 { return true }
-            return false
-        }.count
-        #expect(requestBodyCount == 0)
+        guard case .started(let transaction)? = events.first else {
+            Issue.record("thiếu event .started"); return
+        }
+        guard case .failed(let failedID, _, _)? = events.last else {
+            Issue.record("thiếu event .failed"); return
+        }
+        // Đúng transaction bị đánh hỏng — không phải "có một .failed nào đó".
+        #expect(failedID == transaction.id)
+        // CHÚ Ý: vòng thu ở trên dừng ngay tại `.failed` ĐẦU TIÊN, nên test
+        // này KHÔNG chứng minh được "chỉ có đúng một `.failed`" (một báo cáo
+        // trùng lặp sẽ không quan sát được ở đây). Tính chất đó được kiểm
+        // tất định, thu trọn vẹn mọi event, ở
+        // `upstreamDeathWithPendingTransactionReportsExactlyOnce`.
+    }
+
+    // MARK: - Test tất định trên EmbeddedChannel
+    //
+    // Ba test dưới đây lái thẳng `HTTPProxyHandler` trên `EmbeddedChannel`,
+    // với upstream do test cầm trực tiếp. Lý do không dùng socket thật:
+    // trạng thái cần kiểm là "upstream đã chết mà handler chưa biết", và qua
+    // socket thật ta không dựng được nó tất định — trong đúng khoảnh khắc
+    // upstream chết, `UpstreamHandler.channelInactive` đã trả 502 và đóng
+    // client, nên phần body còn lại của client không bao giờ tới được chỗ
+    // cần kiểm (đó chính là chỗ hỏng của phiên bản test cũ dùng sleep 300ms:
+    // nhánh cần kiểm không hề chạy trong một lần chạy PASS).
+    //
+    // Stub "đã chết" là một `EmbeddedChannel` CHƯA connect: `isActive ==
+    // false` y như một channel đã chết, nhưng còn MỞ nên nó GHI LẠI mọi
+    // write lọt qua guard. Một channel đóng thật thì nuốt luôn write — tức
+    // là chính sự im lặng ta muốn chứng minh lại không quan sát được.
+
+    private func makeEmbeddedProxy(
+        loop: EmbeddedEventLoop, recorder: RecordingSink,
+        configuration: ProxyConfiguration, target: HTTPProxyHandler.Target
+    ) throws -> (handler: HTTPProxyHandler, client: EmbeddedChannel) {
+        let handler = HTTPProxyHandler(configuration: configuration,
+                                       sink: { recorder.record($0) },
+                                       fixedTarget: target)
+        let client = EmbeddedChannel(handler: handler, loop: loop)
+        client.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        return (handler, client)
+    }
+
+    private func requestHead(contentLength: Int?) -> HTTPRequestHead {
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1:8080")
+        if let contentLength {
+            headers.add(name: "Content-Length", value: "\(contentLength)")
+        }
+        return HTTPRequestHead(version: .http1_1, method: .POST, uri: "/upload",
+                               headers: headers)
+    }
+
+    @Test("Head không được ghi ra upstream đã chết, kể cả khi nó chết ngay trong lúc sink .started chạy")
+    func headNeverWrittenToUpstreamThatDiedDuringStartedSink() throws {
+        let loop = EmbeddedEventLoop()
+        // Đóng channel xong mới `run()`: `EmbeddedChannel.close` xếp một task
+        // dọn pipeline lên loop, còn `EmbeddedEventLoop.deinit` precondition
+        // là không còn task nào chưa chạy. defer đăng ký TRƯỚC nên chạy SAU.
+        defer { loop.run() }
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let recorder = RecordingSink()
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: recorder,
+            configuration: ProxyConfiguration(), target: target)
+        defer { client.close(promise: nil) }
+
+        let live = EmbeddedChannel(loop: loop)
+        defer { live.close(promise: nil) }
+        live.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: live, target: target)
+
+        let dead = EmbeddedChannel(loop: loop)
+        defer { dead.close(promise: nil) }
+        #expect(dead.isActive == false)
+
+        // `sink` chạy giữa "isUpstreamReusable vừa xác nhận upstream còn
+        // sống" và "handleUpstreamReady ghi head ra upstream" — và nó là
+        // closure do người gọi truyền vào. Ở đây nó làm đúng cái mà một sink
+        // thật (hoặc một handler Task 7/8 gắn thêm vào pipeline) có thể làm
+        // gián tiếp: khiến upstream không còn dùng được, mà không sửa một
+        // dòng nào trong `HTTPProxyHandler`.
+        recorder.onStarted = { [weak handler] in
+            handler?.upstream = HTTPProxyHandler.UpstreamConnection(channel: dead, target: target)
+        }
+
+        try client.writeInbound(HTTPServerRequestPart.head(requestHead(contentLength: nil)))
+
+        #expect(recorder.startedCount == 1)
+        #expect(try dead.readOutbound(as: HTTPClientRequestPart.self) == nil)
+        #expect(try live.readOutbound(as: HTTPClientRequestPart.self) == nil)
+    }
+
+    @Test("Origin trả lời sớm rồi đóng: phần body còn lại bị nuốt, không ghi ra upstream chết, không có response thứ hai")
+    func deadUpstreamAfterEarlyResponseNeitherWritesNorAnswersTwice() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        var config = ProxyConfiguration()
+        // Cap nhỏ để phần body gửi SAU khi upstream chết vượt cap ngay: đó
+        // là cách duy nhất làm cho lỗi "phân loại lại phần còn lại thành
+        // bufferable" lộ ra ngoài — nó biến thành một 502 THỨ HAI.
+        config.maxInMemoryBodyBytes = 1024
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let recorder = RecordingSink()
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: recorder, configuration: config, target: target)
+        defer { client.close(promise: nil) }
+
+        // Upstream "thật": đã connect, mang `UpstreamHandler` dùng CHUNG
+        // `SessionState` với handler — đúng như `connectUpstream` dựng.
+        let live = EmbeddedChannel(
+            handler: UpstreamHandler(clientChannel: client, configuration: config,
+                                     sink: { recorder.record($0) }, state: handler.state),
+            loop: loop)
+        defer { live.close(promise: nil) }
+        live.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: live, target: target)
+
+        try client.writeInbound(HTTPServerRequestPart.head(requestHead(contentLength: 4096)))
+        guard case .head? = try live.readOutbound(as: HTTPClientRequestPart.self) else {
+            Issue.record("upstream còn sống phải nhận được request head"); return
+        }
+
+        // Origin trả lời SỚM (413) rồi đóng, trong khi client vẫn đang
+        // upload. Đây là đường đi CÓ THẬT tới nhánh "upstream đã chết":
+        // transaction đã `.completed`, nên khi upstream đóng,
+        // `failAllPending` thấy hàng đợi rỗng (`hadPending == false`) →
+        // không phát `.failed` và KHÔNG đóng client. Client cứ thế gửi nốt
+        // body vào một kết nối upstream đã chết.
+        try live.writeInbound(HTTPClientResponsePart.head(
+            HTTPResponseHead(version: .http1_1, status: .payloadTooLarge)))
+        try live.writeInbound(HTTPClientResponsePart.end(nil))
+        guard case .head(let firstResponse)? = try client.readOutbound(as: HTTPServerResponsePart.self) else {
+            Issue.record("client phải nhận được response 413"); return
+        }
+        #expect(firstResponse.status == .payloadTooLarge)
+        guard case .end? = try client.readOutbound(as: HTTPServerResponsePart.self) else {
+            Issue.record("response 413 phải kết thúc bằng .end"); return
+        }
+
+        // Upstream chết. Trong production `handler.upstream` lúc này vẫn trỏ
+        // vào chính channel vừa đóng (`isActive == false`); ta thay bằng stub
+        // chưa-connect chỉ để mọi write lọt qua guard trở nên NHÌN THẤY được.
+        live.close(promise: nil)
+        let dead = EmbeddedChannel(loop: loop)
+        defer { dead.close(promise: nil) }
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: dead, target: target)
+
+        try client.writeInbound(HTTPServerRequestPart.body(ByteBuffer(repeating: 0x43, count: 512)))
+        #expect(try dead.readOutbound(as: HTTPClientRequestPart.self) == nil)
+
+        // Chunk kế VƯỢT cap buffer: nếu phần còn lại của request bị phân loại
+        // lại thành "bufferable" (chỉ nil hoá upstream, không đánh dấu abort),
+        // chỗ này bắn một response 502 THỨ HAI xuống một client vừa nhận đủ
+        // response đầu tiên.
+        try client.writeInbound(HTTPServerRequestPart.body(ByteBuffer(repeating: 0x44, count: 2048)))
+        try client.writeInbound(HTTPServerRequestPart.end(nil))
+
+        #expect(try dead.readOutbound(as: HTTPClientRequestPart.self) == nil)
+        #expect(try client.readOutbound(as: HTTPServerResponsePart.self) == nil)
+        #expect(recorder.startedCount == 1)
+        #expect(recorder.completedCount == 1)
+        #expect(recorder.failedCount == 0)
+        #expect(recorder.requestBodyCount == 0)
+    }
+
+    @Test("Upstream chết khi transaction còn đang chờ: đúng MỘT .failed và đúng một 502 cho client")
+    func upstreamDeathWithPendingTransactionReportsExactlyOnce() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        let config = ProxyConfiguration()
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let recorder = RecordingSink()
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: recorder, configuration: config, target: target)
+        defer { client.close(promise: nil) }
+
+        let live = EmbeddedChannel(
+            handler: UpstreamHandler(clientChannel: client, configuration: config,
+                                     sink: { recorder.record($0) }, state: handler.state),
+            loop: loop)
+        defer { live.close(promise: nil) }
+        live.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: live, target: target)
+
+        try client.writeInbound(HTTPServerRequestPart.head(requestHead(contentLength: 4096)))
+        try client.writeInbound(HTTPServerRequestPart.body(ByteBuffer(repeating: 0x43, count: 512)))
+        guard case .started(let transaction)? = recorder.events.first else {
+            Issue.record("thiếu event .started"); return
+        }
+
+        // Upstream chết khi transaction VẪN đang chờ response. Đúng một bên
+        // được phép báo: `UpstreamHandler.channelInactive`.
+        live.close(promise: nil)
+
+        // `RecordingSink` thu HẾT, không dừng ở event đầu tiên — nên con số 1
+        // dưới đây thật sự có thể sai được nếu có bên thứ hai cùng báo.
+        #expect(recorder.failedCount == 1)
+        guard case .failed(let failedID, _, _)? = recorder.events.last else {
+            Issue.record("thiếu event .failed"); return
+        }
+        #expect(failedID == transaction.id)
+
+        guard case .head(let response)? = try client.readOutbound(as: HTTPServerResponsePart.self) else {
+            Issue.record("client phải nhận được 502"); return
+        }
+        #expect(response.status == .badGateway)
     }
 }

@@ -55,15 +55,16 @@ public final class TrafficStore {
     }
 
     /// Tiêu thụ stream của engine, flush mỗi 100 ms. Trả về `Task` để nơi
-    /// gọi (Task 11) huỷ khi view biến mất: `for await` trên `AsyncStream`
-    /// đã cancellation-aware sẵn (đã kiểm chứng thực nghiệm trên toolchain
-    /// này) — huỷ `Task` này khiến vòng lặp thoát ngay, không cần tự kiểm
-    /// `Task.isCancelled` trong thân vòng lặp.
+    /// gọi (`AppModel`, Task 11) huỷ khi view biến mất: `for await` trên
+    /// `AsyncStream` đã cancellation-aware sẵn (đã kiểm chứng thực nghiệm
+    /// trên toolchain này) — huỷ `Task` này khiến vòng lặp thoát ngay, không
+    /// cần tự kiểm `Task.isCancelled` trong thân vòng lặp.
     ///
-    /// Điều KHÔNG đúng: bản thân stream không bao giờ tự kết thúc, vì
-    /// `ProxyServer` không gọi `continuation.finish()` ở `stop()`/
-    /// `shutdown()`. Đó là một khoảng hở thật nhưng thuộc về task sở hữu
-    /// vòng đời `ProxyServer`, không phải ở đây.
+    /// Stream cũng tự kết thúc khi `ProxyServer.shutdown()` chạy xong (nó gọi
+    /// `continuation.finish()`), nên vòng lặp `for await` dưới đây thoát ra
+    /// bình thường mà `AppModel` không bắt buộc phải huỷ `Task` này — huỷ vẫn
+    /// an toàn (idempotent) cho trường hợp `stop()` được gọi khi consumer
+    /// muốn dừng ngay, không đợi shutdown xong.
     public func consume(_ events: AsyncStream<TrafficEvent>) -> Task<Void, Never> {
         Task { @MainActor in
             let ticker = Task { @MainActor in

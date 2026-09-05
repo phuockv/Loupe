@@ -40,7 +40,7 @@ let package = Package(
             "AppCore",
         ]),
         .testTarget(name: "TrafficModelTests", dependencies: ["TrafficModel"]),
-        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel"]),
+        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel", "CertKit", "ProxyCore"]),
         .testTarget(name: "CertKitTests", dependencies: [
             "CertKit",
             .product(name: "NIOCore", package: "swift-nio"),

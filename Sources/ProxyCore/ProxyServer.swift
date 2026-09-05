@@ -17,6 +17,7 @@ public actor ProxyServer {
     public nonisolated let events: AsyncStream<TrafficEvent>
 
     private nonisolated let sink: TrafficEventSink
+    private let continuation: AsyncStream<TrafficEvent>.Continuation
     private let configuration: ProxyConfiguration
     private let leafCache: LeafCertificateCache
     private let group: MultiThreadedEventLoopGroup
@@ -31,6 +32,7 @@ public actor ProxyServer {
             bufferingPolicy: .bufferingNewest(10_000)
         )
         self.events = stream
+        self.continuation = continuation
         self.sink = { continuation.yield($0) }
     }
 
@@ -90,6 +92,10 @@ public actor ProxyServer {
     }
 
     public func shutdown() async throws {
+        // `defer` chứ không phải câu lệnh cuối: nếu `shutdownGracefully()`
+        // throw, continuation vẫn phải được đóng, nếu không `for await` trên
+        // `events` sẽ treo vĩnh viễn dù server đã coi như dừng.
+        defer { continuation.finish() }
         if channel != nil { try? await stop() }
         try await group.shutdownGracefully()
     }

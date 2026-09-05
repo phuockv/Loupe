@@ -104,6 +104,15 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
         isFinished = true
+        // Dựng NGOÀI `do`: nếu một lệnh bên trong ném sau khi handler này đã
+        // vào pipeline thì `catch` phải BÁO QUA CHÍNH NÓ. Báo thẳng bằng `sink`
+        // rồi `channel.close` sẽ kích hoạt `channelInactive` của nó — lúc đó
+        // chốt vẫn chưa đặt, nên nó phát thêm một `.completed` ĐẾN SAU và che
+        // mất `.failed` vừa phát. Đây là chỗ DUY NHẤT quy tắc "đúng một event
+        // kết thúc" có thể sinh ra hai, với cái SAI đứng cuối.
+        let sessionReporter = MITMSessionReporter(
+            host: host, transactionID: transactionID, sink: sink
+        )
         do {
             var tls = TLSConfiguration.makeServerConfiguration(
                 certificateChain: identity.certificateChain.map { .certificate($0) },
@@ -120,12 +129,9 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
             // bắt đầu handshake ngay trong `handlerAdded` nếu channel đang
             // active, nên nếu lắp ngược thì một lỗi phát sinh ở đúng lệnh gọi
             // đó sẽ không có ai ở dưới để nghe.
-            let errorReporter = MITMSessionReporter(
-                host: host, transactionID: transactionID, sink: sink
-            )
-            try sync.addHandler(errorReporter, position: .before(self))
+            try sync.addHandler(sessionReporter, position: .before(self))
             try sync.addHandler(NIOSSLServerHandler(context: sslContext),
-                                position: .before(errorReporter))
+                                position: .before(sessionReporter))
             try sync.addHandlers([
                 HTTPResponseEncoder(),
                 ByteToMessageHandler(HTTPRequestDecoder()),
@@ -159,11 +165,12 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
                 channel.pipeline.fireChannelReadComplete()
             }
         } catch {
-            // `isFinished` đã bật ở trên nên `abort` không tự chặn; báo cáo
-            // trực tiếp rồi đóng.
-            sink(.failed(id: transactionID,
-                         message: "không lắp được tầng TLS cho \(host): \(error)",
-                         endedAt: Date()))
+            // Qua `sessionReporter`, KHÔNG qua `sink` thẳng: nó vừa phát
+            // `.failed` vừa ĐẶT CHỐT, nên `channel.close` ngay dưới — thứ chạy
+            // `channelInactive` của chính nó nếu nó đã kịp vào pipeline —
+            // không phát thêm một `.completed` đè lên nguyên nhân thật.
+            sessionReporter.reportFailure(
+                "không lắp được tầng TLS cho \(host): \(error)")
             channel.close(promise: nil)
         }
     }
@@ -218,6 +225,15 @@ final class MITMSessionReporter: ChannelInboundHandler {
         self.host = host
         self.transactionID = transactionID
         self.sink = sink
+    }
+
+    /// Phát `.failed` và ĐẶT CHỐT. Dùng cho người dựng pipeline khi việc lắp
+    /// hỏng giữa chừng: chốt là thứ ngăn `channelInactive` ngay sau đó phát
+    /// thêm một `.completed` đè lên nguyên nhân thật.
+    func reportFailure(_ message: String) {
+        guard !hasReportedTerminal else { return }
+        hasReportedTerminal = true
+        sink(.failed(id: transactionID, message: message, endedAt: Date()))
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {

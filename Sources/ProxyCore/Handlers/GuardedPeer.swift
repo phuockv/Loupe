@@ -92,6 +92,19 @@ final class OutputLiveness: ChannelInboundHandler, @unchecked Sendable {
 /// `_contextSync(handlerType:)` bằng `{ $0.handler is Handler }`. Một
 /// `precondition` không test được (nó làm sập tiến trình), còn hàm này thì
 /// được — xem `ConnectTunnelTests`.
+///
+/// PHẠM VI, và nó hẹp hơn cái tên gợi ra — quan trọng với Task 10–12 (app
+/// macOS). Hàm này chỉ thấy tầng TLS nếu nó là một `NIOSSLHandler` NẰM TRONG
+/// pipeline này. Nó KHÔNG thấy:
+///
+/// - một handler tự viết ôm `SSLConnection` mà không kế thừa `NIOSSLHandler`;
+/// - TLS được kết thúc DƯỚI pipeline — `NIOTransportServices` /
+///   Network.framework làm đúng như vậy, và đó là thứ người viết app macOS rất
+///   dễ với tay lấy.
+///
+/// Ở cả hai trường hợp đó, `precondition` sẽ im lặng cho qua và hazard 1 mở lại
+/// nguyên vẹn. Nếu ProxyCore có ngày chạy trên một transport như thế thì phép
+/// kiểm này phải được thay, không phải bổ sung.
 func channelHasTLSLayer(_ channel: Channel) -> Bool {
     channel.eventLoop.preconditionInEventLoop()
     return (try? channel.pipeline.syncOperations.handler(type: NIOSSLHandler.self)) != nil
@@ -251,7 +264,7 @@ extension GuardedPeer where Part == ByteBuffer {
     /// Không có việc này thì mọi lần tải file lớn qua host bypass đều có nguy cơ
     /// mất đuôi: origin ghi nhanh hơn client đọc, origin đóng, và
     /// `channelInactive` đóng luôn phía client trong khi `pendingWrites` còn đầy
-    /// — im lặng, và transaction `.tunnelled` không hiện gì bất thường.
+    /// — im lặng, và transaction của tunnel không hiện gì bất thường.
     ///
     /// PHẢI là `close(mode: .output)` chứ không phải "xả xong rồi đóng hẳn", và
     /// đây là chỗ dễ sai nhất trong cả file:
@@ -327,7 +340,7 @@ extension GuardedPeer where Part == ByteBuffer {
     ///
     /// `onDrainAbandoned` KHÔNG có giá trị mặc định, cùng lý do với việc `write`
     /// không `@discardableResult`: bỏ cuộc giữa lúc xả là CẮT CỤT, và một lần
-    /// cắt cụt không ai kể lại thì transaction vẫn hiện `.tunnelled` sạch sẽ —
+    /// cắt cụt không ai kể lại thì transaction vẫn hiện kết thúc sạch sẽ —
     /// đúng lớp bug cả file này sinh ra để chặn. Người gọi buộc phải nói ra nó
     /// báo cho ai. Tham số nhận số byte bị vứt (`bufferedWritableBytes` tại thời
     /// điểm bỏ cuộc); nó KHÔNG kể phần đã nằm trong send buffer của kernel mà

@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOPosix
 import NIOHTTP1
 import NIOSSL
@@ -372,5 +373,36 @@ struct MITMProxyTests {
         #expect(id == connect.id)
         #expect(response.statusCode == 200)
         #expect(response.reasonPhrase == "Connection Established")
+    }
+
+    /// `MITMUpgradeHandler.install` lắp người báo cáo TRƯỚC ba lệnh có thể ném
+    /// (cố ý: `NIOSSLHandler` bắt tay ngay trong `handlerAdded`, nên người nghe
+    /// phải có mặt trước). Hệ quả: nếu một lệnh ném, `catch` báo `.failed` rồi
+    /// `channel.close` — và lần đóng đó chạy `channelInactive` của chính người
+    /// báo cáo. Chốt chưa đặt thì nó phát thêm một `.completed` ĐẾN SAU, che
+    /// mất nguyên nhân thật.
+    ///
+    /// Đường tới đó gần như không xảy ra (context TLS đã dựng xong, pipeline
+    /// đang sống), nên bài này ghim QUY TẮC ở mức đơn vị thay vì cố dựng lại
+    /// tình huống: báo lỗi rồi đóng phải cho đúng MỘT event, và nó phải là
+    /// `.failed`.
+    @Test("Báo lỗi rồi đóng chỉ cho đúng một event kết thúc, và đó là .failed")
+    func reportFailureLatchesAgainstLaterCleanEnd() throws {
+        let recorder = RecordingSink()
+        let id = UUID()
+        let reporter = MITMSessionReporter(host: "example.com", transactionID: id,
+                                           sink: { recorder.record($0) })
+
+        let channel = EmbeddedChannel()
+        defer { _ = try? channel.finish() }
+        try channel.pipeline.syncOperations.addHandler(reporter)
+
+        reporter.reportFailure("không lắp được tầng TLS")
+        // Chính là thứ `channel.close(promise: nil)` trong `catch` gây ra.
+        channel.pipeline.fireChannelInactive()
+
+        #expect(recorder.failedCount == 1)
+        #expect(recorder.completedCount == 0,
+                "một `.completed` đến sau sẽ che mất nguyên nhân thật")
     }
 }

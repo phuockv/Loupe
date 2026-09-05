@@ -485,7 +485,7 @@ struct ConnectTunnelTests {
                 "phải nêu \(accepted.count) byte đã chuyển được, không phải \(inflated): \(failures.first ?? "-")")
     }
 
-    @Test("Host trong bypass list được relay byte thô hai chiều và ghi transaction .tunnelled")
+    @Test("Host trong bypass list được relay byte thô hai chiều và ghi transaction isTunnelled")
     func relaysBytesForBypassedHost() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         defer { Task { try? await group.shutdownGracefully() } }
@@ -538,9 +538,7 @@ struct ConnectTunnelTests {
         #expect(transaction.host == "127.0.0.1")
         #expect(transaction.port == originPort)
         #expect(transaction.response == nil, "tunnel mù không có response để hiện")
-        if case .tunnelled = transaction.state {} else {
-            Issue.record("state phải là .tunnelled, nhận: \(transaction.state)")
-        }
+        #expect(transaction.isTunnelled, "host trong bypass list phải được đánh isTunnelled")
 
         try await client.close()
     }
@@ -606,9 +604,7 @@ struct ConnectTunnelTests {
         }
         #expect(starts.count == 2, "một .started cho GET, một cho CONNECT")
         let connectTransaction = try #require(starts.last)
-        if case .tunnelled = connectTransaction.state {} else {
-            Issue.record("CONNECT phải .tunnelled, nhận: \(connectTransaction.state)")
-        }
+        #expect(connectTransaction.isTunnelled, "CONNECT trong bypass list phải isTunnelled")
         let plaintextTransaction = try #require(starts.first)
         let failures = collected.compactMap { event -> UUID? in
             if case .failed(let id, _, _) = event { return id }
@@ -961,7 +957,7 @@ struct ConnectTunnelTests {
     }
 
     /// Ảnh gương của bài cùng tên bên `MITMProxyTests`, cho nhánh tunnel mù.
-    /// Cùng một lỗ hổng, cùng một cơ chế vá: `.tunnelled` được mở ở
+    /// Cùng một lỗ hổng, cùng một cơ chế vá: transaction CONNECT được mở ở
     /// `establishTunnel` và trước Task 8 fix round 1 thì mọi đường phát event
     /// kết thúc cho nó đều là đường LỖI — một tunnel chạy tốt rồi đóng sạch
     /// không phát gì cả, và dòng đó kẹt vĩnh viễn.
@@ -1020,9 +1016,11 @@ struct ConnectTunnelTests {
             return nil
         }
         let transaction = try #require(started.first)
-        if case .tunnelled = transaction.state {} else {
-            Issue.record("host trong bypass list phải mở ở .tunnelled")
-        }
+        // ĐÂY là điều mà việc tách `.tunnelled` ra khỏi `TransactionState` mua
+        // được: transaction vừa `isTunnelled` (chưa từng bị giải mã) vừa
+        // `.completed` (tunnel đã chạy xong và đóng sạch). Với enum cũ thì
+        // `.completed` xoá mất vế đầu.
+        #expect(transaction.isTunnelled, "host trong bypass list phải isTunnelled")
         guard case .completed(let id, let response, _)? = collected.last else {
             Issue.record("tunnel đóng sạch phải phát .completed, nhận: \(collected)")
             return
@@ -1111,5 +1109,148 @@ struct ConnectTunnelTests {
         reporter.reportFailure("tới muộn")
         #expect(events.failedCount == 0)
         #expect(events.completedCount == 1)
+    }
+
+    /// Hai unit test ở trên ghim QUY TẮC của `TunnelReporter`, còn bài
+    /// end-to-end ghim ĐƯỜNG DÂY. Chỗ chưa ai giữ là ĐÚNG SỐ lời gọi: xoá một
+    /// `legOpened` thì `.completed` bắn ngay ở chân đầu — chính con bug tôi tự
+    /// bắt được bằng tay trong lúc viết bản vá — mà cả ba bài kia vẫn xanh.
+    ///
+    /// Bài này lái một `TunnelRelayHandler` THẬT trên loopback (cùng khuôn với
+    /// `rejectedBytesAreNotCountedAsRelayed`) với một `TunnelReporter` dựng tay,
+    /// nên đếm được chính xác: hai chân mở, handler đóng ĐÚNG một chân.
+    @Test("Chân upstream đóng khi chân client còn sống: chưa phải kết thúc sạch")
+    func relayHandlerClosesExactlyOneLeg() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let clientSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { clientSide.closeAll() }
+        let upstreamSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { upstreamSide.closeAll() }
+
+        let recorder = RecordingSink()
+        let reporter = try await loop.submit { () -> TunnelReporter in
+            let reporter = TunnelReporter(transactionID: UUID(),
+                                          sink: { recorder.record($0) })
+            reporter.legOpened()   // chân client, do ConnectTunnelHandler mở
+            reporter.legOpened()   // chân upstream
+            try upstreamSide.near.pipeline.syncOperations.addHandler(
+                TunnelRelayHandler(client: GuardedPeer(channel: clientSide.near),
+                                   reporter: reporter))
+            return reporter
+        }.get()
+
+        // Chân upstream đóng hẳn; chân client vẫn sống.
+        try await upstreamSide.near.close()
+
+        let afterUpstreamClosed = try await loop.submit { recorder.completedCount }.get()
+        #expect(afterUpstreamClosed == 0,
+                "chân client còn sống thì chưa được coi là tunnel kết thúc sạch")
+
+        // Chân cuối đóng: BÂY GIỜ mới sạch. Cũng chứng minh handler vừa gọi
+        // `legClosed` đúng MỘT lần — hai lần thì bộ đếm đã về 0 ở trên rồi.
+        try await loop.submit { reporter.legClosed() }.get()
+        let afterBothClosed = try await loop.submit { recorder.completedCount }.get()
+        #expect(afterBothClosed == 1)
+    }
+
+    /// Client bỏ đi TRƯỚC khi upstream connect xong. Không có bản vá thì
+    /// `openLegs` về 0 (chân upstream chưa từng mở) và một tunnel chưa chở được
+    /// byte nào được ghi là `.completed` — một dòng nói phiên đã chạy xong, cho
+    /// một phiên chưa từng bắt đầu.
+    ///
+    /// Tất định theo CẤU TẠO chứ không theo tốc độ: `channelInactive` được bắn
+    /// trong CÙNG một lượt event loop với `handlerAdded`, nên future của
+    /// `connect` — dù thành công hay hỏng — không thể hoàn tất xen vào giữa.
+    @Test("Client bỏ đi giữa lúc còn đang connect: ghi .failed, không phải .completed")
+    func abandonedConnectIsRecordedAsFailure() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let clientSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { clientSide.closeAll() }
+
+        // Một port vừa được cấp rồi trả lại: connect tới nó không thành công,
+        // và nó nằm trên loopback nên không đụng mạng ngoài.
+        let placeholder = try await ServerBootstrap(group: loop)
+            .bind(host: "127.0.0.1", port: 0).get()
+        let deadPort = placeholder.localAddress!.port!
+        try await placeholder.close()
+
+        let recorder = RecordingSink()
+        try await loop.submit {
+            let handler = ConnectTunnelHandler(
+                host: "127.0.0.1", port: deadPort, transactionID: UUID(),
+                maxBufferedBytes: 64 * 1024, sink: { recorder.record($0) })
+            try clientSide.near.pipeline.syncOperations.addHandler(handler)
+            clientSide.near.pipeline.fireChannelInactive()
+        }.get()
+
+        let events = try await loop.submit { recorder.events }.get()
+        #expect(recorder.completedCount == 0,
+                "tunnel chưa từng thông không được ghi .completed: \(events)")
+        let failures = events.compactMap { event -> String? in
+            if case .failed(_, let message, _) = event { return message }
+            return nil
+        }
+        #expect(failures.count == 1)
+        #expect(failures.first?.contains("trước khi tunnel") == true,
+                "message phải nêu tunnel chưa sẵn sàng: \(failures.first ?? "-")")
+    }
+
+    /// Ảnh gương cho chân CLIENT: `TunnelRelayHandler` được ghim ở bài trên,
+    /// còn `ConnectTunnelHandler` mở HAI chân (chân mình trong `handlerAdded`,
+    /// chân upstream khi connect xong) và không đường công khai nào đếm được.
+    ///
+    /// Mẹo để không phải thêm accessor: sau khi cả hai chân đã mở, test tự gọi
+    /// `legClosed()` đúng MỘT lần. Nếu handler mở đủ hai chân thì `openLegs`
+    /// còn 1 và chưa có gì được phát; nếu ai xoá một `legOpened` thì nó về 0 và
+    /// `.completed` bắn ngay — đúng con bug N3.
+    @Test("ConnectTunnelHandler mở đúng hai chân: một lần đóng chưa phải kết thúc")
+    func connectTunnelHandlerOpensBothLegs() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let origin = try await startByteEchoServer(group: loop)
+        defer { origin.close(promise: nil) }
+        let originPort = origin.localAddress!.port!
+
+        let clientSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { clientSide.closeAll() }
+
+        let recorder = RecordingSink()
+        let payload = Data("hai-chan".utf8)
+
+        let handler = try await loop.submit { () -> ConnectTunnelHandler in
+            let handler = ConnectTunnelHandler(
+                host: "127.0.0.1", port: originPort, transactionID: UUID(),
+                maxBufferedBytes: 64 * 1024, sink: { recorder.record($0) })
+            try clientSide.near.pipeline.syncOperations.addHandler(handler)
+            var buffer = clientSide.near.allocator.buffer(capacity: payload.count)
+            buffer.writeBytes(payload)
+            clientSide.near.pipeline.fireChannelRead(buffer)
+            return handler
+        }.get()
+
+        // Byte dội về tới đầu kia của loopback = upstream đã connect VÀ đã được
+        // nhận nuôi, tức chân thứ hai chắc chắn đã mở. Đây là mốc quan sát
+        // được, không phải một khoảng chờ.
+        let echoed = try await loop.submit {
+            clientSide.farBytes.expect(payload.count, on: loop, timeout: .seconds(5))
+        }.get().get()
+        #expect(echoed == payload)
+
+        try await loop.submit { handler.reporter.legClosed() }.get()
+        let completed = try await loop.submit { recorder.completedCount }.get()
+        #expect(completed == 0,
+                "mới một chân đóng: handler phải đã mở đủ hai chân")
     }
 }

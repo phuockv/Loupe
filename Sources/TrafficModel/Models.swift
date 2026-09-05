@@ -68,12 +68,20 @@ public struct ResponseModel: Sendable {
     }
 }
 
+/// VÒNG ĐỜI của một transaction, và CHỈ vòng đời.
+///
+/// `.tunnelled` từng nằm ở đây và đã được tách ra thành `Transaction.isTunnelled`.
+/// Lý do: nó mô tả CÁCH XỬ LÝ ("không giải mã"), một sự thật cố định từ lúc
+/// `.started`, trong khi ba case còn lại mô tả transaction đang ở đâu trong vòng
+/// đời. Nhét cả hai vào một ô nghĩa là bất kỳ ai xử lý event `.completed` —
+/// thứ mà một tunnel mù bây giờ CÓ phát khi nó đóng sạch — cũng xoá mất tín
+/// hiệu "kết nối này chưa từng bị giải mã". Đúng cái tín hiệu mà người dùng
+/// thêm host vào bypass list để có (ngân hàng, app pin cert), và nó sẽ biến
+/// thành một dòng "completed" trông y hệt mọi dòng khác.
 public enum TransactionState: Sendable {
     case pending
     case completed
     case failed(reason: String)
-    /// CONNECT nằm trong bypass list: chỉ relay byte, không giải mã.
-    case tunnelled
 }
 
 public struct Transaction: Identifiable, Sendable {
@@ -86,6 +94,12 @@ public struct Transaction: Identifiable, Sendable {
     public var request: RequestModel
     public var response: ResponseModel?
     public var state: TransactionState
+    /// CONNECT nằm trong bypass list: proxy chỉ relay byte thô, KHÔNG giải mã.
+    ///
+    /// Cố định từ lúc `.started` và độc lập với `state` — xem `TransactionState`.
+    /// Một transaction có thể vừa `isTunnelled` vừa `.completed`: tunnel đã chạy
+    /// xong và đóng sạch, mà nội dung thì proxy chưa từng đọc được.
+    public let isTunnelled: Bool
     public var bytesSent: Int
     public var bytesReceived: Int
 
@@ -100,7 +114,8 @@ public struct Transaction: Identifiable, Sendable {
         host: String,
         port: Int,
         request: RequestModel,
-        state: TransactionState = .pending
+        state: TransactionState = .pending,
+        isTunnelled: Bool = false
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -110,6 +125,7 @@ public struct Transaction: Identifiable, Sendable {
         self.request = request
         self.response = nil
         self.state = state
+        self.isTunnelled = isTunnelled
         self.bytesSent = 0
         self.bytesReceived = 0
     }

@@ -111,7 +111,7 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
         let transaction = Transaction(
             scheme: .https, host: host, port: port,
             request: RequestModel(method: "CONNECT", url: url),
-            state: bypassed ? .tunnelled : .pending
+            isTunnelled: bypassed
         )
         sink(.started(transaction))
 

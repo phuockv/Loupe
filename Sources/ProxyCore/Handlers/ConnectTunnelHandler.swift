@@ -18,7 +18,12 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     private let port: Int
     private let transactionID: UUID
     private let maxBufferedBytes: Int
-    private let reporter: TunnelReporter
+    /// `internal` (không `private`) chỉ để test đếm được số chân đang mở —
+    /// cùng lý do với `HTTPProxyHandler.state`. "Đúng SỐ lời gọi `legOpened`"
+    /// không quan sát được qua bề mặt công khai, mà xoá một lời gọi lại làm
+    /// `.completed` bắn sớm ở chân đầu và nuốt mất một `.failed` đến sau.
+    /// Không nơi nào khác trong ProxyCore đụng tới nó.
+    let reporter: TunnelReporter
 
     private var upstream: GuardedPeer<ByteBuffer>?
     /// Channel client mà handler này đang ngồi trên, bọc CÙNG kiểu peer để dùng
@@ -37,6 +42,9 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// Tunnel đã kết thúc (client ngắt, connect hỏng, hoặc một chiều chết).
     /// Chặn cả việc dựng tiếp lẫn việc phát `.failed` hai lần.
     private var isFinished = false
+    /// Upstream đã connect xong và được nhận nuôi, tức tunnel đã THẬT SỰ thông
+    /// hai đầu ít nhất một lần. Xem `channelInactive`.
+    private var didEstablishUpstream = false
 
     init(host: String, port: Int, transactionID: UUID,
          maxBufferedBytes: Int, sink: @escaping TrafficEventSink) {
@@ -91,6 +99,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
                 return
             }
             upstream = peer
+            didEstablishUpstream = true
             reporter.legOpened()
             let replay = buffered
             buffered = []
@@ -139,9 +148,26 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// thẳng: phần byte ta ĐÃ nhận từ client và đã chuyển cho upstream có thể
     /// còn kẹt trong `pendingWrites` của upstream (origin đọc chậm hơn client
     /// gửi). Đóng thẳng là vứt chúng — origin nhận một request TLS cụt trong
-    /// khi transaction `.tunnelled` không hiện gì bất thường.
+    /// khi transaction của tunnel không hiện gì bất thường.
     func channelInactive(context: ChannelHandlerContext) {
         isFinished = true
+        // Client bỏ đi TRƯỚC khi upstream connect xong: tunnel chưa bao giờ
+        // thông, chưa chở được byte nào. Không báo gì ở đây thì `legClosed`
+        // ngay dưới đưa `openLegs` về 0 (chân upstream chưa từng được mở) và
+        // phát `.completed` — một dòng nói rằng phiên đã chạy xong, cho một
+        // phiên chưa từng bắt đầu.
+        //
+        // LỰA CHỌN CÓ CHỦ Ý, không phải hệ quả của thứ tự: báo `.failed`.
+        // Cùng cách `HTTPProxyHandler.handlerRemoved` xử lý ca tương đương bên
+        // đường HTTP ("request bị bỏ dở trước khi nhận được response"), và
+        // message nêu HIỆN TƯỢNG chứ không quy lỗi cho ai. Cái giá phải trả:
+        // nếu connect sau đó CŨNG hỏng thì chốt at-most-once giữ lại nguyên
+        // nhân này thay vì lỗi connect — đúng ý, vì client đã bỏ đi TRƯỚC, nên
+        // lỗi connect đến sau không còn ảnh hưởng tới ai.
+        if !didEstablishUpstream {
+            reporter.reportFailure(
+                "client ngắt kết nối trước khi tunnel tới \(host):\(port) sẵn sàng")
+        }
         drainUpstream()
         upstream = nil
         buffered = []
@@ -200,7 +226,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// ai báo là upstream đã chết, nên nó chỉ phát hiện ra khi client gửi thêm
     /// byte và `write` trả `false`. Đóng thẳng ngay lúc đó là `close0` gọi
     /// `cancelWritesOnClose` và vứt đúng cái đuôi vừa được xếp hàng — im lặng,
-    /// trên ĐƯỜNG THÀNH CÔNG, với transaction `.tunnelled` không hiện gì bất
+    /// trên ĐƯỜNG THÀNH CÔNG, với transaction của tunnel không hiện gì bất
     /// thường. Client vừa chậm đọc vừa còn gửi không phải ca hiếm: HTTP/2 rải
     /// WINDOW_UPDATE và PING suốt một lần tải.
     ///

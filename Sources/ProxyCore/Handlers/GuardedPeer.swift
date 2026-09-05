@@ -19,15 +19,23 @@ import NIOCore
 /// 2. `ChannelEvent.outputClosed` — sự kiện NIO bắn khi `shutdown(how: .WR)`
 ///    thật sự xảy ra (`BaseStreamSocketChannel.close0` bắn nó ở cả nhánh đóng
 ///    ngay lẫn nhánh đóng sau khi xả xong). Đường này bắt cả trường hợp ai đó
-///    nửa-đóng channel KHÔNG qua `GuardedPeer` — đáng kể với Task 8, vì
-///    `NIOSSLHandler` biến `close(mode: .output)` thành close_notify và forward
-///    `outputClosed` qua nhánh `default` của `userInboundEventTriggered`.
+///    nửa-đóng channel KHÔNG qua `GuardedPeer`.
+///
+/// GIỚI HẠN mà đường (2) KHÔNG phủ, và Task 8 phải biết: trên một channel có
+/// `NIOSSLHandler`, `closeOutput` đặt state `.outputClosed` của CHÍNH nó ngay ở
+/// ĐẦU thủ tục và từ giây đó mọi write bị `promise?.fail(ChannelError.outputClosed)`
+/// — với `promise: nil` là một byte biến mất im lặng. Nhưng `OutputLiveness` ngồi
+/// ở `.first`, tức DƯỚI tầng TLS, nên nó chỉ thấy `outputClosed` khi SOCKET
+/// nửa-đóng ở cuối thủ tục shutdown TLS. Cửa sổ giữa hai mốc đó nằm ngoài tầm
+/// nhìn của cờ này. Kết luận đang được giữ: KHÔNG nửa-đóng chiều ra của một
+/// channel có TLS (đường MitM không gọi `closeAfterPendingWrites` ở đâu cả).
 ///
 /// `@unchecked Sendable` có cơ sở chứ không phải để làm ngơ: mọi lần đọc/ghi cờ
 /// đều nằm trên event loop của channel — `userInboundEventTriggered` theo định
-/// nghĩa, còn hai lối kia đi qua `GuardedPeer`, mà `GuardedPeer.init` BẮT BUỘC
-/// chạy trên event loop đó (`pipeline.syncOperations` precondition điều đó) và
-/// `write` assert lại.
+/// nghĩa, còn hai lối kia đi qua `GuardedPeer`, mà `GuardedPeer.init` và
+/// `GuardedPeer.write` đều `preconditionInEventLoop()` (KHÔNG phải `assert` —
+/// xem chú thích ở `GuardedPeer.init`), nên ràng buộc còn hiệu lực trong cả
+/// release build.
 final class OutputLiveness: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = NIOAny
 
@@ -118,16 +126,30 @@ struct GuardedPeer<Part: Sendable> {
     private let channel: Channel
     private let output: OutputLiveness
 
-    /// PHẢI chạy trên event loop của `channel` — `pipeline.syncOperations`
-    /// precondition điều đó, nên vi phạm là crash ngay tại chỗ dựng chứ không
-    /// phải một cuộc đua âm thầm sau này.
+    /// PHẢI chạy trên event loop của `channel`, và `preconditionInEventLoop()`
+    /// ở dòng đầu là thứ ép điều đó — vi phạm là crash ngay tại chỗ dựng chứ
+    /// không phải một cuộc đua âm thầm sau này.
+    ///
+    /// Vì sao KHÔNG dựa vào `pipeline.syncOperations` (bản trước của chú thích
+    /// này khẳng định như vậy, và khẳng định đó SAI): mọi lối vào của
+    /// `SynchronousOperations` chỉ gọi `assertInEventLoop`, mà `assertInEventLoop`
+    /// bọc trong `debugOnly` — trong release nó không kiểm gì cả. Dựng
+    /// `GuardedPeer` ngoài loop trong một bản release vì thế sẽ sửa danh sách
+    /// liên kết của pipeline từ thread khác và đua trên một `Bool` không đồng
+    /// bộ, im lặng. Cả cơ sở của `@unchecked Sendable` trên `OutputLiveness`
+    /// lẫn việc bỏ khoá đều đứng trên ràng buộc này, nên nó phải là
+    /// `precondition` chứ không phải `assert`.
     ///
     /// Đó không phải phiền toái thêm vào: mọi chỗ dựng `GuardedPeer` trong
     /// ProxyCore đều nằm trong callback của một handler hoặc trong
     /// `channelInitializer` của một bootstrap ghim vào đúng loop ấy (upstream
-    /// luôn `ClientBootstrap(group: context.eventLoop)`). Và chính ràng buộc
-    /// này là thứ cho phép `OutputLiveness` không cần khoá.
+    /// luôn `ClientBootstrap(group: context.eventLoop)`). Đáng chú ý:
+    /// `UpstreamHandler.init` dựng peer cho channel CLIENT từ bên trong
+    /// `channelInitializer` của channel UPSTREAM — hợp lệ chỉ vì hai channel
+    /// dùng chung một event loop, và giờ điều đó được kiểm thật thay vì được
+    /// lập luận.
     init(channel: Channel) {
+        channel.eventLoop.preconditionInEventLoop()
         self.channel = channel
         self.output = OutputLiveness.attached(to: channel)
     }
@@ -155,8 +177,13 @@ struct GuardedPeer<Part: Sendable> {
     ///   trách nhiệm của bên đóng: `closeDiscardingPendingWrites` mang cái tên
     ///   dài đó vì lý do này, và watchdog xả trong `closeAfterPendingWrites`
     ///   bắt buộc phải báo cáo phần nó vứt.
+    ///
+    /// `preconditionInEventLoop()` chứ không phải `assertInEventLoop()`: cái sau
+    /// là `debugOnly`, tức trong release một lần ghi ngoài loop sẽ chạy thẳng
+    /// vào `OutputLiveness.isOutputClosed` (một `Bool` không đồng bộ) và vào
+    /// hàng đợi ghi của channel từ thread lạ.
     func write(_ part: Part, flush: Bool) -> Bool {
-        channel.eventLoop.assertInEventLoop()
+        channel.eventLoop.preconditionInEventLoop()
         guard channel.isActive, !output.isOutputClosed else { return false }
         if flush {
             channel.writeAndFlush(part, promise: nil)

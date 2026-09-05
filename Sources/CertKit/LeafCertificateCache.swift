@@ -26,6 +26,12 @@ public actor LeafCertificateCache {
     private var usageOrder: [String] = []   // cuối mảng = vừa dùng gần nhất
 
     public init(authority: CertificateAuthority, capacity: Int = 512) throws {
+        // capacity <= 0 thì evictIfNeeded() không bao giờ đủ chỗ cho entry vừa
+        // thêm ở certificate(forHost:), nhưng identity(forHost:) vẫn ghi vào
+        // identityCache sau đó — entry đó lọt khỏi usageOrder/cache và không
+        // bao giờ bị evict nữa. Lỗi lập trình, không phải input runtime, nên
+        // chặn bằng precondition thay vì throw.
+        precondition(capacity >= 1, "LeafCertificateCache capacity phải >= 1")
         self.authority = authority
         self.capacity = capacity
         self.leafKey = P256.Signing.PrivateKey()
@@ -91,6 +97,10 @@ public actor LeafCertificateCache {
         usageOrder.append(host)
     }
 
+    /// Bất biến: khoá của `identityCache` luôn là tập con khoá của `cache`, và
+    /// cả hai luôn bị evict cùng một lượt ở đây. Thêm write vào một cache mà
+    /// không thêm vào cache kia (hoặc vào usageOrder) sẽ phá bất biến này và
+    /// làm entry đó rò rỉ vĩnh viễn khỏi LRU.
     private func evictIfNeeded() {
         while usageOrder.count > capacity {
             let oldest = usageOrder.removeFirst()

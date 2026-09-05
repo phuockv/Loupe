@@ -60,6 +60,131 @@ final class BodyEchoServerHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 }
 
+/// Server HTTP tích luỹ trọn vẹn body rồi trả lại số byte + byte đầu/cuối +
+/// checksum (tổng modulo) — đủ để phân biệt "origin A nhận đúng body A" và
+/// "origin B nhận đúng body B" khi hai request dùng lại MỘT kết nối upstream
+/// (không chỉ đếm byte, còn phát hiện nếu nội dung bị lẫn/lệch).
+final class ChecksumEchoServerHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+    private var body = Data()
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        switch unwrapInboundIn(data) {
+        case .head: body.removeAll()
+        case .body(let buffer): body.append(Data(buffer.readableBytesView))
+        case .end:
+            let sum = body.reduce(UInt64(0)) { $0 &+ UInt64($1) }
+            let payload = "count=\(body.count);first=\(body.first ?? 0);last=\(body.last ?? 0);sum=\(sum)"
+            var headers = HTTPHeaders()
+            headers.add(name: "Content-Length", value: "\(payload.utf8.count)")
+            context.write(wrapOutboundOut(.head(
+                HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)
+            )), promise: nil)
+            var out = context.channel.allocator.buffer(capacity: payload.utf8.count)
+            out.writeString(payload)
+            context.write(wrapOutboundOut(.body(.byteBuffer(out))), promise: nil)
+            context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+        }
+    }
+}
+
+/// Gom MỘT response HTTP trọn vẹn (head+body+end) qua promise được đăng ký
+/// trước khi gửi request. Dùng trong `RawSequentialClient` để lái đúng MỘT
+/// kết nối TCP tới proxy qua nhiều request tuần tự — thứ URLSession không
+/// hứa hẹn (không lộ ra việc nó có mở connection mới cho origin khác không),
+/// nên test tái dùng-upstream cần tự kiểm soát bằng client thô như thế này.
+final class RawResponseCollector: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPClientResponsePart
+
+    private var head: HTTPResponseHead?
+    private var bodyData = Data()
+    /// CHỈ được gán/đọc trên event loop của channel — xem `RawSequentialClient.send`.
+    var pendingPromise: EventLoopPromise<(status: Int, body: String)>?
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        switch unwrapInboundIn(data) {
+        case .head(let h): head = h; bodyData = Data()
+        case .body(let buffer): bodyData.append(Data(buffer.readableBytesView))
+        case .end:
+            guard let head else { return }
+            let text = String(data: bodyData, encoding: .utf8) ?? ""
+            pendingPromise?.succeed((Int(head.status.code), text))
+            pendingPromise = nil
+            self.head = nil
+        }
+    }
+}
+
+/// Client HTTP thô, tự quản MỘT kết nối TCP duy nhất tới proxy, để gửi tuần
+/// tự nhiều request absolute-form đảm bảo tái dùng đúng một connection —
+/// điều kiện bắt buộc để test đường "đổi host trên cùng client connection"
+/// một cách tất định, không phụ thuộc hành vi pool connection nội bộ (không
+/// quan sát được từ bên ngoài) của URLSession.
+struct RawSequentialClient {
+    let channel: Channel
+    let collector: RawResponseCollector
+
+    static func connect(group: EventLoopGroup, proxyPort: Int) async throws -> RawSequentialClient {
+        let collector = RawResponseCollector()
+        let channel = try await ClientBootstrap(group: group)
+            .channelInitializer { channel in
+                channel.pipeline.addHTTPClientHandlers().flatMap {
+                    channel.pipeline.addHandler(collector)
+                }
+            }
+            .connect(host: "127.0.0.1", port: proxyPort)
+            .get()
+        return RawSequentialClient(channel: channel, collector: collector)
+    }
+
+    /// Gửi một request absolute-form POST rồi đợi trọn vẹn response. Đăng ký
+    /// promise và ghi request đều được đẩy vào đúng event loop của channel
+    /// (qua `submit`/`flatMap`, không có bước nào chạy ngoài nó), nên
+    /// `collector.pendingPromise` không bao giờ bị đụng từ hai nơi cùng lúc.
+    ///
+    /// Có timeout tường minh: nếu bug tái xuất, origin không bao giờ nhận
+    /// `.end` nên không bao giờ trả response — không có timeout, test sẽ
+    /// treo vĩnh viễn thay vì thất bại rõ ràng (đã tự kiểm chứng bằng cách
+    /// chạy thử, treo >3 phút, phải kill process).
+    func send(host: String, port: Int, path: String, body: Data,
+             timeout: TimeAmount = .seconds(5)) async throws -> (status: Int, body: String) {
+        let eventLoop = channel.eventLoop
+        let collector = self.collector
+        let channel = self.channel
+        let future: EventLoopFuture<(status: Int, body: String)> = eventLoop.submit {
+            eventLoop.makePromise(of: (status: Int, body: String).self)
+        }.flatMap { promise in
+            collector.pendingPromise = promise
+            var headers = HTTPHeaders()
+            headers.add(name: "Host", value: "\(host):\(port)")
+            headers.add(name: "Content-Length", value: "\(body.count)")
+            let head = HTTPRequestHead(version: .http1_1, method: .POST,
+                                       uri: "http://\(host):\(port)\(path)", headers: headers)
+            channel.write(NIOAny(HTTPClientRequestPart.head(head)), promise: nil)
+            var buffer = channel.allocator.buffer(capacity: body.count)
+            buffer.writeBytes(body)
+            channel.write(NIOAny(HTTPClientRequestPart.body(.byteBuffer(buffer))), promise: nil)
+            channel.writeAndFlush(NIOAny(HTTPClientRequestPart.end(nil)), promise: nil)
+
+            let timeoutTask = eventLoop.scheduleTask(in: timeout) {
+                // Nếu response không bao giờ tới (bug tái xuất), đừng để
+                // channelRead sau này (nếu có) succeed() một promise đã
+                // fail() — dọn tham chiếu trước.
+                collector.pendingPromise = nil
+                promise.fail(RawSequentialClientTimeoutError())
+            }
+            promise.futureResult.whenComplete { _ in timeoutTask.cancel() }
+            return promise.futureResult
+        }
+        return try await future.get()
+    }
+}
+
+struct RawSequentialClientTimeoutError: Error, CustomStringConvertible {
+    var description: String { "RawSequentialClient.send timed out waiting for a response" }
+}
+
 @Suite("Proxy HTTP plaintext")
 struct PlainHTTPProxyTests {
 
@@ -236,5 +361,95 @@ struct PlainHTTPProxyTests {
         #expect(requestBodyEvents.count == 1)
         #expect(requestBodyEvents.first?.id == transaction.id)
         #expect(requestBodyEvents.first?.payload.totalBytes == bodySize)
+    }
+
+    @Test("POST body nguyên vẹn cho cả hai origin khi request thứ hai đổi host trên cùng kết nối client")
+    func postBodySurvivesUpstreamHostSwitch() async throws {
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await originGroup.shutdownGracefully() } }
+
+        func startChecksumOrigin() async throws -> Channel {
+            try await ServerBootstrap(group: originGroup)
+                .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+                .childChannelInitializer { channel in
+                    channel.pipeline.configureHTTPServerPipeline().flatMap {
+                        channel.pipeline.addHandler(ChecksumEchoServerHandler())
+                    }
+                }
+                .bind(host: "127.0.0.1", port: 0)
+                .get()
+        }
+
+        // Hai origin RIÊNG BIỆT: request thứ hai nhắm origin B bắt buộc
+        // handler phải mở upstream MỚI (khác host:port với origin A) — đúng
+        // đường tái dùng-upstream mà bug CRITICAL (fix round 2, mục 1) từng
+        // ghi đè lên channel cũ đã đóng.
+        let originA = try await startChecksumOrigin()
+        defer { try? originA.close().wait() }
+        let originAPort = originA.localAddress!.port!
+
+        let originB = try await startChecksumOrigin()
+        defer { try? originB.close().wait() }
+        let originBPort = originB.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        // Thu event: phải thấy đủ hai `.completed`, KHÔNG được có `.failed`
+        // xen giữa — đó chính xác là triệu chứng của bug mục 2 (đóng upstream
+        // cũ rút nhầm transaction MỚI khỏi SessionState dùng chung).
+        let collected = Task {
+            var events: [TrafficEvent] = []
+            var completedCount = 0
+            for await event in server.events {
+                events.append(event)
+                if case .completed = event {
+                    completedCount += 1
+                    if completedCount == 2 { break }
+                }
+            }
+            return events
+        }
+
+        // MỘT kết nối TCP duy nhất tới proxy, tự lái — đảm bảo tái dùng
+        // connection thật (không phải giả định về pool của URLSession, thứ
+        // không hứa hẹn và không quan sát được từ bên ngoài).
+        let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await clientGroup.shutdownGracefully() } }
+        let client = try await RawSequentialClient.connect(group: clientGroup, proxyPort: proxyPort)
+        defer { client.channel.close(promise: nil) }
+
+        // Hai body PHÂN BIỆT rõ ràng (byte lấp đầy khác nhau, độ dài khác
+        // nhau) để nếu nội dung bị lẫn giữa hai origin, checksum lệch ngay,
+        // không chỉ "count" trùng hợp giống nhau.
+        let bodyA = Data(repeating: 0xAA, count: 300_000)
+        let bodyB = Data(repeating: 0xBB, count: 500_000)
+
+        let responseA = try await client.send(host: "127.0.0.1", port: originAPort,
+                                               path: "/upload-a", body: bodyA)
+        let sumA = bodyA.reduce(UInt64(0)) { $0 &+ UInt64($1) }
+        #expect(responseA.status == 200)
+        #expect(responseA.body == "count=\(bodyA.count);first=170;last=170;sum=\(sumA)")
+
+        let responseB = try await client.send(host: "127.0.0.1", port: originBPort,
+                                               path: "/upload-b", body: bodyB)
+        let sumB = bodyB.reduce(UInt64(0)) { $0 &+ UInt64($1) }
+        #expect(responseB.status == 200)
+        #expect(responseB.body == "count=\(bodyB.count);first=187;last=187;sum=\(sumB)")
+
+        let events = await collected.value
+        let failedEvents = events.filter {
+            if case .failed = $0 { return true }
+            return false
+        }
+        #expect(failedEvents.isEmpty)
+        let completedCount = events.filter {
+            if case .completed = $0 { return true }
+            return false
+        }.count
+        #expect(completedCount == 2)
     }
 }

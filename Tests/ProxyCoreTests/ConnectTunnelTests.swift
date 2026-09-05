@@ -16,6 +16,47 @@ final class ByteEchoHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 }
 
+/// Origin: im lặng cho tới khi đã NHẬN đủ `triggerAfterBytes` byte, rồi ghi
+/// nguyên `payload` và nửa-đóng (chỉ FIN chiều ra). Không dội ngược gì — dòng
+/// byte về client phải là đúng `payload`, nên đếm được chính xác bao nhiêu byte
+/// tới nơi.
+///
+/// Nửa-đóng chứ không đóng hẳn là để test TẤT ĐỊNH: nếu đóng hẳn, phần upload
+/// còn trên đường của client sẽ đập vào một socket đã biến mất và origin đáp
+/// RST — mà RST làm kernel VỨT phần dữ liệu proxy chưa kịp đọc, tức có những
+/// lần test đỏ vì mất byte ở tầng OS, không phải vì lỗi trong proxy. Chiều vào
+/// vẫn mở nên proxy vẫn thấy EOF và vẫn đi đúng đường cần kiểm.
+final class BulkDownloadThenCloseHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+
+    private let payload: Data
+    private let triggerAfterBytes: Int
+    private let closed: EventLoopPromise<Void>
+    private var receivedBytes = 0
+    private var fired = false
+
+    init(payload: Data, triggerAfterBytes: Int, closed: EventLoopPromise<Void>) {
+        self.payload = payload
+        self.triggerAfterBytes = triggerAfterBytes
+        self.closed = closed
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        receivedBytes += unwrapInboundIn(data).readableBytes
+        guard !fired, receivedBytes >= triggerAfterBytes else { return }
+        fired = true
+        let channel = context.channel
+        let closed = self.closed
+        var out = channel.allocator.buffer(capacity: payload.count)
+        out.writeBytes(payload)
+        // Đóng trong completion của chính lần ghi: đóng thẳng ở đây thì origin
+        // tự cắt cụt phần mình vừa gửi và test sẽ đo nhầm bên bị lỗi.
+        channel.writeAndFlush(out).whenComplete { _ in
+            channel.close(mode: .output).whenComplete { _ in closed.succeed(()) }
+        }
+    }
+}
+
 struct TunnelWaitTimeout: Error, CustomStringConvertible {
     let waitingFor: Int
     var description: String {
@@ -127,20 +168,27 @@ struct ConnectTunnelTests {
     }
 
     private func connectRawClient(
-        group: EventLoopGroup, proxyPort: Int
+        group: EventLoopGroup, proxyPort: Int, receiveBufferBytes: Int? = nil
     ) async throws -> (channel: Channel, collector: RawByteCollector) {
         let collector = RawByteCollector()
-        let channel = try await ClientBootstrap(group: group)
+        var bootstrap = ClientBootstrap(group: group)
             .channelInitializer { $0.pipeline.addHandler(collector) }
-            .connect(host: "127.0.0.1", port: proxyPort)
-            .get()
+        if let receiveBufferBytes {
+            // Buffer nhận nhỏ để phần đuôi của lần tải chắc chắn còn nằm trong
+            // `pendingWrites` phía proxy khi client ngừng đọc — không phải đoán
+            // xem kernel tự nới buffer tới đâu.
+            bootstrap = bootstrap.channelOption(
+                .socketOption(.so_rcvbuf), value: SocketOptionValue(receiveBufferBytes))
+        }
+        let channel = try await bootstrap.connect(host: "127.0.0.1", port: proxyPort).get()
         return (channel, collector)
     }
 
     private func expect(
-        _ count: Int, from collector: RawByteCollector, on channel: Channel
+        _ count: Int, from collector: RawByteCollector, on channel: Channel,
+        timeout: TimeAmount = .seconds(5)
     ) -> EventLoopFuture<Data> {
-        channel.eventLoop.submit { collector.expect(count, on: channel.eventLoop) }
+        channel.eventLoop.submit { collector.expect(count, on: channel.eventLoop, timeout: timeout) }
             .flatMap { $0 }
     }
 
@@ -341,6 +389,98 @@ struct ConnectTunnelTests {
         #expect(try await afterEcho.get() == afterHandover)
 
         try await client.close()
+    }
+
+    /// Client chậm đọc mà VẪN CÒN GỬI, đúng lúc origin tải xong rồi đóng.
+    ///
+    /// Đây là lỗ hổng của chính cơ chế graceful close: `TunnelRelayHandler`
+    /// thấy upstream chết và XẾP HÀNG một close có drain cho phía client, nhưng
+    /// `ConnectTunnelHandler` không được ai báo — nó chỉ phát hiện khi client
+    /// gửi thêm byte và `upstream.write` trả `false`. Nếu lúc đó nó đóng THẲNG
+    /// channel client, `cancelWritesOnClose` vứt đúng cái đuôi vừa được xếp
+    /// hàng. Im lặng, trên đường THÀNH CÔNG.
+    ///
+    /// Bốn test kia không chạm tới được: cả bốn đều để client đọc liên tục, nên
+    /// `pendingWrites` phía client không bao giờ có gì để mất.
+    ///
+    /// Cửa sổ ở đây tới bằng NHÂN QUẢ chứ không bằng canh giờ: client bơm LIÊN
+    /// TỤC suốt cả bài test (mỗi lần ghi tự nhịp theo socket, không có sleep
+    /// nào), nên chắc chắn có byte client tới proxy SAU khi proxy xử lý xong
+    /// EOF của upstream — đó chính là byte làm `upstream.write` trả `false`.
+    /// Bơm một lượng cố định rồi dừng thì không đủ: đo thử thấy có lần cả
+    /// lượng bơm đó tới nơi trước EOF và nhánh cần kiểm không hề chạy.
+    @Test("Origin đóng sau khi tải xong trong lúc client chậm đọc mà còn gửi: không mất byte nào")
+    func doesNotTruncateDownloadWhenClientStillWritingAsOriginCloses() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 3)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let download = Data((0..<(8 * 1024 * 1024)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) })
+        let uploadChunk = Data(repeating: 0x5A, count: 64 * 1024)
+
+        let originClosed = group.next().makePromise(of: Void.self)
+        let origin = try await ServerBootstrap(group: group)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                channel.pipeline.addHandler(BulkDownloadThenCloseHandler(
+                    payload: download,
+                    triggerAfterBytes: uploadChunk.count,
+                    closed: originClosed
+                ))
+            }
+            .bind(host: "127.0.0.1", port: 0)
+            .get()
+        defer { origin.close(promise: nil) }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = ["127.0.0.1"]
+
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let (client, collector) = try await connectRawClient(
+            group: group, proxyPort: proxyPort, receiveBufferBytes: 16 * 1024)
+
+        let expectedResponse = Self.expectedConnectResponse
+        let responseFuture = expect(expectedResponse.utf8.count, from: collector, on: client)
+        try await write(Data("""
+        CONNECT 127.0.0.1:\(originPort) HTTP/1.1\r
+        Host: 127.0.0.1:\(originPort)\r
+        \r
+
+        """.utf8), to: client)
+        #expect(String(decoding: try await responseFuture.get(), as: UTF8.self) == expectedResponse)
+
+        // Client ngừng đọc: từ đây mọi byte proxy gửi về đọng lại ở
+        // `pendingWrites` phía proxy.
+        try await client.setOption(.autoRead, value: false).get()
+
+        // Bơm liên tục cho tới khi channel đóng. Không sleep: mỗi `await` chỉ
+        // trả về khi lần ghi trước đã ra socket, nên vòng lặp tự nhịp.
+        let uploader = Task {
+            while !Task.isCancelled {
+                var buffer = client.allocator.buffer(capacity: uploadChunk.count)
+                buffer.writeBytes(uploadChunk)
+                do { try await client.writeAndFlush(buffer) } catch { return }
+            }
+        }
+        defer { uploader.cancel() }
+
+        try await originClosed.futureResult.get()
+
+        // Giờ mới đọc. Nếu phía client bị đóng thẳng, phần lớn 8 MiB đã bị
+        // `cancelWritesOnClose` vứt và chờ ở đây sẽ hỏng.
+        let downloadFuture = expect(download.count, from: collector, on: client,
+                                    timeout: .seconds(30))
+        try await client.setOption(.autoRead, value: true).get()
+        client.read()
+
+        let received = try await downloadFuture.get()
+        #expect(received.count == download.count,
+                "nhận \(received.count)/\(download.count) byte")
+        #expect(received == download, "nội dung tải về không khớp nguyên văn")
     }
 
     /// Nhánh KHÔNG bypass đi qua đúng cùng một đoạn gỡ pipeline rồi mới rẽ

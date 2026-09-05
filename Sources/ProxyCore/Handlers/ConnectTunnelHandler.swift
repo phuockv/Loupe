@@ -21,6 +21,12 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     private let sink: TrafficEventSink
 
     private var upstream: GuardedPeer<ByteBuffer>?
+    /// Channel client mà handler này đang ngồi trên, bọc CÙNG kiểu peer để dùng
+    /// được `closeAfterPendingWrites`. Ràng buộc `Part == ByteBuffer` của hàm
+    /// đó là có lý do (một `ByteBuffer` rỗng đi qua pipeline còn encoder HTTP
+    /// là crash), và ràng buộc ấy chỉ còn giá trị nếu mọi channel đều đi qua
+    /// `GuardedPeer` — kể cả channel của chính mình.
+    private var client: GuardedPeer<ByteBuffer>?
     /// Byte client gửi trước khi upstream sẵn sàng — gồm cả phần byte mà
     /// decoder HTTP đẩy xuống lúc bị gỡ (`leftOverBytesStrategy: .forwardBytes`),
     /// vốn tới NGAY sau khi handler này được lắp. Có trần vì đây là dữ liệu
@@ -42,6 +48,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
 
     func handlerAdded(context: ChannelHandlerContext) {
         let clientChannel = context.channel
+        client = GuardedPeer(channel: clientChannel)
         // Ghim upstream vào ĐÚNG event loop của client channel: hai đầu tunnel
         // không bao giờ chạy song song, nên `buffered`/`upstream` không cần khoá.
         let boundSelf = NIOLoopBoundBox(self, eventLoop: context.eventLoop)
@@ -79,7 +86,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
             bufferedBytes = 0
             for (index, buffer) in replay.enumerated() {
                 guard peer.write(buffer, flush: index == replay.count - 1) else {
-                    abandon(clientChannel: clientChannel)
+                    upstreamVanished()
                     return
                 }
             }
@@ -91,7 +98,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
             sink(.failed(id: transactionID,
                          message: "tunnel không nối được \(host):\(port) — \(error)",
                          endedAt: Date()))
-            abandon(clientChannel: clientChannel)
+            abandon()
         }
     }
 
@@ -104,7 +111,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
                 sink(.failed(id: transactionID,
                              message: "client gửi quá \(maxBufferedBytes) byte trước khi tunnel tới \(host):\(port) sẵn sàng",
                              endedAt: Date()))
-                abandon(clientChannel: context.channel)
+                abandon()
                 return
             }
             bufferedBytes += buffer.readableBytes
@@ -116,7 +123,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         // và không có cách nào báo lỗi trong băng (client đang nói TLS), nên
         // đóng nốt phía client để nó BIẾT — thay vì im lặng nuốt byte.
         if !upstream.write(buffer, flush: true) {
-            abandon(clientChannel: context.channel)
+            upstreamVanished()
         }
     }
 
@@ -134,14 +141,48 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         context.fireChannelInactive()
     }
 
-    /// Lỗi trên channel client. Báo cáo GIỐNG HỆT nhánh connect hỏng: với người
+    /// Lỗi trên channel CLIENT. Báo cáo GIỐNG HỆT nhánh connect hỏng: với người
     /// dùng thì cả hai đều là "tunnel này chết", nên cả hai phải phát `.failed`.
+    ///
+    /// Nhưng đóng thì KHÁC: lỗi ở chân client không nói gì về những byte ta đã
+    /// nhận HỢP LỆ từ client và đã chuyển cho upstream. Vứt chúng là đúng lớp
+    /// bug "proxy nói dối về thứ nó đã gửi" — nên phía upstream đóng có drain,
+    /// còn phía client (chân đang lỗi) đóng thẳng.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         guard !isFinished else { return }
         sink(.failed(id: transactionID,
                      message: "lỗi trên tunnel tới \(host):\(port) — \(error)",
                      endedAt: Date()))
-        abandon(clientChannel: context.channel)
+        isFinished = true
+        buffered = []
+        bufferedBytes = 0
+        upstream?.closeAfterPendingWrites()
+        upstream = nil
+        client?.closeDiscardingPendingWrites()
+    }
+
+    /// Upstream đã chết trong khi client VẪN CÒN GỬI. Đóng phía client bằng
+    /// `closeAfterPendingWrites`, không phải đóng thẳng.
+    ///
+    /// Vì sao khác biệt này quan trọng: khi origin kết thúc một lần tải rồi
+    /// đóng, `TunnelRelayHandler.channelInactive` bên kia vừa XẾP HÀNG một
+    /// graceful close để phần đuôi kịp chảy về client. Handler này không được
+    /// ai báo là upstream đã chết, nên nó chỉ phát hiện ra khi client gửi thêm
+    /// byte và `write` trả `false`. Đóng thẳng ngay lúc đó là `close0` gọi
+    /// `cancelWritesOnClose` và vứt đúng cái đuôi vừa được xếp hàng — im lặng,
+    /// trên ĐƯỜNG THÀNH CÔNG, với transaction `.tunnelled` không hiện gì bất
+    /// thường. Client vừa chậm đọc vừa còn gửi không phải ca hiếm: HTTP/2 rải
+    /// WINDOW_UPDATE và PING suốt một lần tải.
+    ///
+    /// Byte client gửi từ đây trở đi không còn chỗ nào để tới — upstream đã
+    /// chết — nên chúng bị bỏ; `isFinished` chặn ở đầu `channelRead`.
+    private func upstreamVanished() {
+        guard !isFinished else { return }
+        isFinished = true
+        upstream = nil
+        buffered = []
+        bufferedBytes = 0
+        client?.closeAfterPendingWrites()
     }
 
     /// Kết thúc tunnel từ phía ta: đóng cả hai đầu và bỏ phần còn đệm.
@@ -151,14 +192,14 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// Đây là đường HUỶ (connect hỏng, vượt trần buffer, lỗi, một chiều chết
     /// giữa chừng), nên vứt phần chưa flush là đúng ý: tunnel đã hỏng rồi, đẩy
     /// nốt một mẩu byte lẻ sang chỉ làm peer thấy dữ liệu cụt mà tưởng đủ.
-    private func abandon(clientChannel: Channel) {
+    private func abandon() {
         guard !isFinished else { return }
         isFinished = true
         upstream?.closeDiscardingPendingWrites()
         upstream = nil
         buffered = []
         bufferedBytes = 0
-        clientChannel.close(promise: nil)
+        client?.closeDiscardingPendingWrites()
     }
 }
 
@@ -171,15 +212,28 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
     private let client: GuardedPeer<ByteBuffer>
+    /// Channel upstream mà handler này đang ngồi trên — cùng lý do như
+    /// `ConnectTunnelHandler.client`: `closeAfterPendingWrites` chỉ tồn tại
+    /// trên `GuardedPeer<ByteBuffer>`, và đó là ràng buộc muốn giữ.
+    private var upstream: GuardedPeer<ByteBuffer>?
 
     init(client: GuardedPeer<ByteBuffer>) {
         self.client = client
     }
 
+    func handlerAdded(context: ChannelHandlerContext) {
+        upstream = GuardedPeer(channel: context.channel)
+    }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         if !client.write(unwrapInboundIn(data), flush: true) {
-            // Client đã biến mất: nửa kia của tunnel không còn chỗ để đi.
-            context.close(promise: nil)
+            // Client đã biến mất. Đóng phía upstream có drain, không đóng
+            // thẳng: nó có thể đang giữ byte client đã gửi mà origin chưa đọc
+            // hết — kể cả phần `ConnectTunnelHandler.channelInactive` vừa xếp
+            // hàng để drain khi client ngắt. Đây là ảnh gương của
+            // `upstreamVanished()`, và đóng thẳng ở đây là cắt cụt đúng cái
+            // request TLS mà chú thích bên kia sinh ra để bảo vệ.
+            upstream?.closeAfterPendingWrites()
         }
     }
 
@@ -193,10 +247,21 @@ final class TunnelRelayHandler: ChannelInboundHandler {
         context.fireChannelInactive()
     }
 
-    /// Lỗi thì ngược lại: dòng byte đã hỏng, đừng cố giao nốt phần đuôi của một
-    /// thứ không còn đúng — đóng thẳng để client THẤY nó đứt.
+    /// Lỗi trên channel UPSTREAM. Phía client vẫn đóng CÓ DRAIN, không đóng
+    /// thẳng — và đây không phải chi tiết vụn:
+    ///
+    /// ca tới được là ca THÀNH CÔNG thường gặp nhất. Client vừa tải vừa gửi
+    /// (HTTP/2 rải WINDOW_UPDATE suốt lần tải), origin tải xong rồi đóng HẲN,
+    /// proxy đẩy nốt phần upload còn trên đường vào một socket đã đóng, origin
+    /// đáp RST, và channel upstream nổ `ECONNRESET` NGAY SAU KHI toàn bộ nội
+    /// dung tải về đã nằm yên trong `pendingWrites` phía client. Đóng thẳng ở
+    /// đây là vứt trọn cái đuôi đó — đo được: 701 KB tới nơi trên 8 MiB.
+    ///
+    /// Lỗi ở chân upstream không nói gì về tính toàn vẹn của những byte ta ĐÃ
+    /// nhận từ upstream và đã xếp hàng cho client. Chân đang lỗi thì đóng
+    /// thẳng; chân còn lại vẫn được trả nốt thứ nó được nợ.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        client.closeDiscardingPendingWrites()
+        client.closeAfterPendingWrites()
         context.close(promise: nil)
     }
 }

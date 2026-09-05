@@ -11,10 +11,12 @@ import NIOCore
 /// `HTTPProxyHandler` (qua `UpstreamConnection`), `UpstreamHandler`,
 /// `ConnectTunnelHandler` và `TunnelRelayHandler`. Nó KHÔNG phải một bất biến
 /// toàn ProxyCore: ai viết handler mới vẫn có thể nhận `Channel` trần qua init
-/// và ghi vào đó, compiler không phản đối. Ba bản `respond(channel:)` trong
-/// `HTTPProxyHandler`/`ProxyEntryHandler` vẫn ghi thẳng — chúng ghi vào channel
-/// của CHÍNH pipeline mình đang nằm trong, không phải một peer, nên nằm ngoài
-/// hình dạng này; đã ghi nhận, chưa gộp vào đây.
+/// và ghi vào đó, compiler không phản đối. Còn đúng HAI chỗ ghi thẳng:
+/// `HTTPProxyHandler.respond(channel:)` và `ProxyEntryHandler.respond(channel:)`
+/// (bản thứ ba, `UpstreamHandler.respond`, đã chuyển sang đây). Cả hai ghi vào
+/// channel của CHÍNH pipeline mình đang nằm trong chứ không phải một peer, và
+/// cả hai đã đóng bên trong promise của lần `writeAndFlush` cuối — tức không
+/// cắt cụt được. Thứ chúng thiếu chỉ là phép kiểm `isActive` trước khi ghi.
 ///
 /// Vì sao phải cứng tới mức đó: bug "ghi vào một channel không nhận được, byte
 /// biến mất im lặng, trong khi transaction ta ghi lại vẫn hiện đầy đủ" đã tái
@@ -65,11 +67,15 @@ struct GuardedPeer<Part: Sendable> {
         return true
     }
 
-    /// Ghi part CUỐI CÙNG rồi đóng channel khi chính lần ghi đó đã ra tới
-    /// socket — không cắt cụt phần vừa ghi lẫn phần còn kẹt trước đó.
+    /// Ghi part CUỐI CÙNG của một response kết thúc (`.end`) rồi đóng channel
+    /// khi chính lần ghi đó đã ra tới socket — không cắt cụt phần vừa ghi lẫn
+    /// phần còn kẹt trước đó.
     ///
-    /// Không trả tín hiệu vì không có gì để người gọi xử lý: channel đã chết
-    /// thì nó không ghi gì và đóng luôn, đúng thứ người gọi định làm.
+    /// CHỈ dùng cho đúng ngữ cảnh đó, không phải cho việc ghi nói chung: đây là
+    /// hàm ghi DUY NHẤT trên `GuardedPeer` không trả tín hiệu từ chối, và nó
+    /// được phép như vậy vì ở ngữ cảnh này không có gì để người gọi xử lý —
+    /// channel đã chết thì không ghi gì và đóng luôn, đúng thứ người gọi định
+    /// làm. Mọi lần ghi khác phải qua `write(_:flush:)` và phải xử lý `false`.
     func writeThenClose(_ part: Part) {
         let channel = self.channel
         guard channel.isActive else {
@@ -95,31 +101,53 @@ struct GuardedPeer<Part: Sendable> {
 }
 
 extension GuardedPeer where Part == ByteBuffer {
-    /// Đóng SAU KHI mọi byte đã ghi ra hết socket. Dùng cho hai đầu tunnel: khi
-    /// một chiều chết, phần đuôi đã nhận được của chiều kia vẫn phải tới nơi.
+    /// Kết thúc chiều RA sau khi mọi byte đã ghi tới nơi, rồi để channel tự đóng
+    /// hẳn khi peer đóng nốt chiều của nó. Dùng cho hai đầu tunnel: khi một
+    /// chiều chết, phần đuôi đã nhận được của chiều kia vẫn phải tới nơi.
     ///
-    /// Không có việc này thì mọi lần tải file lớn qua host bypass đều có nguy
-    /// cơ mất đuôi: origin ghi nhanh hơn client đọc, origin đóng, và
-    /// `channelInactive` đóng luôn phía client trong khi `pendingWrites` còn
-    /// đầy — im lặng, và transaction `.tunnelled` không hiện gì bất thường.
+    /// Không có việc này thì mọi lần tải file lớn qua host bypass đều có nguy cơ
+    /// mất đuôi: origin ghi nhanh hơn client đọc, origin đóng, và
+    /// `channelInactive` đóng luôn phía client trong khi `pendingWrites` còn đầy
+    /// — im lặng, và transaction `.tunnelled` không hiện gì bất thường.
     ///
-    /// Cách làm là idiom của NIO: xếp thêm một lần ghi RỖNG có promise. Promise
-    /// trong `PendingStreamWritesState` hoàn tất theo đúng thứ tự FIFO khi byte
-    /// thoát ra socket (`didWrite` coi mục 0 byte ở đầu hàng là đã ghi xong),
-    /// nên promise của mục rỗng cuối hàng chỉ nổ sau khi mọi byte trước nó đã đi.
+    /// PHẢI là `close(mode: .output)` chứ không phải "xả xong rồi đóng hẳn", và
+    /// đây là chỗ dễ sai nhất trong cả file:
     ///
-    /// Đánh đổi: nếu peer còn sống mà KHÔNG BAO GIỜ đọc, lần ghi đó không bao
-    /// giờ xong và channel không bao giờ đóng. Đó là hành vi đúng của một tunnel
-    /// (ta còn nợ peer số byte đó) và bị chặn trên bởi kích thước buffer socket,
-    /// nhưng nó không có timeout.
-    func closeAfterPendingWrites() {
+    /// - `.output` của NIO tự nó đã là "xả rồi mới đóng": `close0` đưa promise
+    ///   cho `pendingWrites.closeOutbound(_:)` và chỉ `shutdown(how: .WR)` sau
+    ///   khi hàng đợi ghi đã sạch. Không cần tự xếp một lần ghi rỗng làm mốc.
+    /// - Đóng HẲN sau khi xả xong VẪN mất byte, và bản vá đầu tiên của tôi mắc
+    ///   đúng lỗi đó: xả sạch `pendingWrites` của NIO không có nghĩa là byte đã
+    ///   tới client — chúng còn nằm trong send buffer của kernel. `close()` một
+    ///   socket đang CÒN dữ liệu chưa đọc ở chiều vào thì BSD/POSIX gửi RST chứ
+    ///   không gửi FIN, và RST vứt luôn send buffer. Mà "còn dữ liệu chưa đọc ở
+    ///   chiều vào" chính là ca ta đang xử lý: client vẫn đang gửi. Đo được:
+    ///   promise xả báo `success()` xong client vẫn chỉ nhận 701 KB trên 8 MiB.
+    ///   `shutdown(how: .WR)` gửi FIN, không đụng gì tới dữ liệu đang chờ.
+    ///
+    /// Channel đóng hẳn lúc peer đóng chiều của nó (EOF → NIO đóng hẳn vì
+    /// `allowRemoteHalfClosure` mặc định là false), hoặc lúc hết `timeout` —
+    /// chặn trên để một peer không bao giờ đóng cũng không giữ channel mãi mãi.
+    ///
+    /// Vẫn ràng buộc `Part == ByteBuffer` dù giờ không còn ghi gì: nửa-đóng
+    /// chiều ra là ngữ nghĩa của TUNNEL. Với một channel HTTP thì nó sai — sau
+    /// khi FIN đi rồi ta không còn nói được gì với client nữa, kể cả một lỗi.
+    func closeAfterPendingWrites(within timeout: TimeAmount = .seconds(15)) {
         let channel = self.channel
         guard channel.isActive else {
             channel.close(promise: nil)
             return
         }
-        let promise = channel.eventLoop.makePromise(of: Void.self)
-        promise.futureResult.whenComplete { _ in channel.close(promise: nil) }
-        channel.writeAndFlush(channel.allocator.buffer(capacity: 0), promise: promise)
+        // Hạn chót cho TOÀN BỘ việc dọn dẹp, không riêng phần xả: sau nửa-đóng
+        // ta còn chờ peer đóng nốt chiều của nó. Huỷ khi channel đóng hẳn để
+        // không giữ một task treo lơ lửng cho mỗi lần dọn tunnel.
+        // `Scheduled.cancel()` sau khi task đã chạy là an toàn: NIO ghi rõ cancel
+        // là best-effort, và `_setValue` chỉ nhận giá trị đầu tiên
+        // (`if self._value == nil`), không precondition.
+        let deadline = channel.eventLoop.scheduleTask(in: timeout) {
+            channel.close(promise: nil)
+        }
+        channel.closeFuture.whenComplete { _ in deadline.cancel() }
+        channel.close(mode: .output, promise: nil)
     }
 }

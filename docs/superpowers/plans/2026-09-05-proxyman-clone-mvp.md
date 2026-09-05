@@ -871,7 +871,7 @@ struct LeafCertificateCacheTests {
 
     @Test("Leaf mang đúng SAN dNSName của host")
     func leafCarriesHostSAN() async throws {
-        let cache = LeafCertificateCache(authority: try makeAuthority())
+        let cache = try LeafCertificateCache(authority: try makeAuthority())
         let leaf = try await cache.certificate(forHost: "api.example.com")
 
         let san = try leaf.extensions.subjectAlternativeNames
@@ -885,7 +885,7 @@ struct LeafCertificateCacheTests {
     @Test("Leaf chain hợp lệ tới Root CA")
     func leafChainsToAuthority() async throws {
         let authority = try makeAuthority()
-        let cache = LeafCertificateCache(authority: authority)
+        let cache = try LeafCertificateCache(authority: authority)
         let leaf = try await cache.certificate(forHost: "api.example.com")
 
         var verifier = Verifier(rootCertificates: CertificateStore([authority.certificate])) {
@@ -900,14 +900,14 @@ struct LeafCertificateCacheTests {
 
     @Test("notBefore lùi về quá khứ để chịu lệch đồng hồ")
     func notBeforeIsBackdated() async throws {
-        let cache = LeafCertificateCache(authority: try makeAuthority())
+        let cache = try LeafCertificateCache(authority: try makeAuthority())
         let leaf = try await cache.certificate(forHost: "api.example.com")
         #expect(leaf.notValidBefore < Date().addingTimeInterval(-1800))
     }
 
     @Test("Cùng host thì trả lại cert đã cache, không mint mới")
     func cachesPerHost() async throws {
-        let cache = LeafCertificateCache(authority: try makeAuthority())
+        let cache = try LeafCertificateCache(authority: try makeAuthority())
         let first = try await cache.certificate(forHost: "api.example.com")
         let second = try await cache.certificate(forHost: "api.example.com")
         #expect(first.serialNumber == second.serialNumber)
@@ -915,7 +915,7 @@ struct LeafCertificateCacheTests {
 
     @Test("Vượt capacity thì host cũ nhất bị đẩy ra")
     func evictsLeastRecentlyUsed() async throws {
-        let cache = LeafCertificateCache(authority: try makeAuthority(), capacity: 2)
+        let cache = try LeafCertificateCache(authority: try makeAuthority(), capacity: 2)
         let a1 = try await cache.certificate(forHost: "a.com")
         _ = try await cache.certificate(forHost: "b.com")
         _ = try await cache.certificate(forHost: "c.com")   // đẩy a.com ra
@@ -925,7 +925,7 @@ struct LeafCertificateCacheTests {
 
     @Test("identity() trả về vật liệu NIOSSL dùng được")
     func producesUsableNIOSSLIdentity() async throws {
-        let cache = LeafCertificateCache(authority: try makeAuthority())
+        let cache = try LeafCertificateCache(authority: try makeAuthority())
         let identity = try await cache.identity(forHost: "api.example.com")
 
         // Dựng được NIOSSLContext nghĩa là BoringSSL đã chấp nhận cặp cert/key.
@@ -945,7 +945,7 @@ Expected: FAIL, "cannot find 'LeafCertificateCache' in scope".
 
 - [ ] **Step 3: Viết implementation**
 
-`Sources/CertKit/LeafCertificateCache.swift`. **Ở Step 6 bạn sẽ chọn `.der` hay `.pem` theo kết luận spike của Task 1** — mặc định viết `.pem` vì đó là đường chắc nhất của BoringSSL:
+`Sources/CertKit/LeafCertificateCache.swift`. **Ở Step 5 bạn sẽ chọn `.der` hay `.pem` theo kết luận spike của Task 1** — mặc định viết `.pem` vì đó là đường chắc nhất của BoringSSL:
 
 ```swift
 import Foundation
@@ -1045,21 +1045,12 @@ public actor LeafCertificateCache {
 }
 ```
 
-- [ ] **Step 4: Cập nhật test cho `init` throwing**
-
-`init` giờ `throws`, nên mọi chỗ dựng cache trong test phải thành `try`:
-
-```swift
-let cache = try LeafCertificateCache(authority: try makeAuthority())
-let cache = try LeafCertificateCache(authority: try makeAuthority(), capacity: 2)
-```
-
-- [ ] **Step 5: Chạy test**
+- [ ] **Step 4: Chạy test**
 
 Run: `swift test --filter LeafCertificateCacheTests`
 Expected: PASS cả 6 test.
 
-- [ ] **Step 6: Nếu Task 1 kết luận `DER: true`, đổi sang DER và chạy lại**
+- [ ] **Step 5: Nếu Task 1 kết luận `DER: true`, đổi sang DER và chạy lại**
 
 DER tránh được một vòng encode/decode PEM mỗi lần khởi động. Sửa một dòng:
 
@@ -1070,7 +1061,7 @@ self.nioLeafKey = try NIOSSLPrivateKey(bytes: Array(leafKey.derRepresentation), 
 Run: `swift test --filter LeafCertificateCacheTests`
 Expected: PASS. Nếu đỏ, quay lại `.pem` và giữ nguyên — đây là tối ưu nhỏ, không đáng đánh đổi.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add Sources/CertKit Tests/CertKitTests

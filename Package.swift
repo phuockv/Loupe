@@ -49,6 +49,7 @@ let package = Package(
         ]),
         .testTarget(name: "ProxyCoreTests", dependencies: [
             "ProxyCore",
+            "TrafficModel",
             .product(name: "NIOEmbedded", package: "swift-nio"),
             .product(name: "NIOHTTP1", package: "swift-nio"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),

@@ -7,7 +7,18 @@ import TrafficModel
 final class UpstreamHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPClientResponsePart
 
-    private let clientChannel: Channel
+    /// Channel client bọc trong `GuardedPeer`, KHÔNG phải `Channel` trần.
+    ///
+    /// Chiều này (response về client) có cùng lớp bug với chiều request mà
+    /// `GuardedPeer` sinh ra để chặn — ghi vào một client đã biến mất thì byte
+    /// tan biến im lặng trong khi transaction vẫn ghi `.completed`. Nó còn có
+    /// một chế độ hỏng nặng hơn kể từ Task 7: sau khi một `CONNECT` bàn giao
+    /// channel này cho tunnel byte thô, encoder HTTP đã bị gỡ, nên một
+    /// `HTTPServerResponsePart` ghi vào đây là `fatalError` ở đáy pipeline chứ
+    /// không phải lỗi nhẹ. Hôm nay không đường nào tới được đó (xem
+    /// `HTTPProxyHandler.handlerRemoved`), nhưng thứ giữ nó đóng chỉ là một lập
+    /// luận về thứ tự — đúng kiểu lập luận đã hỏng bốn lần ở file bên cạnh.
+    private let client: GuardedPeer<HTTPServerResponsePart>
     private let configuration: ProxyConfiguration
     private let sink: TrafficEventSink
     private let state: SessionState
@@ -17,7 +28,7 @@ final class UpstreamHandler: ChannelInboundHandler {
 
     init(clientChannel: Channel, configuration: ProxyConfiguration,
          sink: @escaping TrafficEventSink, state: SessionState) {
-        self.clientChannel = clientChannel
+        self.client = GuardedPeer(channel: clientChannel)
         self.configuration = configuration
         self.sink = sink
         self.state = state
@@ -34,20 +45,37 @@ final class UpstreamHandler: ChannelInboundHandler {
             if let id = state.pendingIDs.first {
                 sink(.responseHead(id: id, Self.model(from: head, body: .none)))
             }
-            clientChannel.write(NIOAny(HTTPServerResponsePart.head(head)), promise: nil)
+            guard client.write(.head(head), flush: false) else {
+                clientVanished(context: context)
+                return
+            }
 
         case .body(let buffer):
             collector?.append(Data(buffer.readableBytesView))
-            clientChannel.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(buffer))), promise: nil)
+            guard client.write(.body(.byteBuffer(buffer)), flush: false) else {
+                clientVanished(context: context)
+                return
+            }
 
         case .end(let trailers):
-            clientChannel.writeAndFlush(NIOAny(HTTPServerResponsePart.end(trailers)), promise: nil)
+            guard client.write(.end(trailers), flush: true) else {
+                clientVanished(context: context)
+                return
+            }
             finish()
         }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         failAllPending(reason: "lỗi upstream: \(error)")
+        context.close(promise: nil)
+    }
+
+    /// Client đã biến mất giữa lúc ta còn đang chuyển response về cho nó.
+    /// Không báo cáo gì ở đây: đóng upstream làm `channelInactive` chạy ngay
+    /// trong cùng lệnh gọi đồng bộ đó, và nó là nơi DUY NHẤT phát `.failed` cho
+    /// các transaction còn chờ.
+    private func clientVanished(context: ChannelHandlerContext) {
         context.close(promise: nil)
     }
 
@@ -84,9 +112,12 @@ final class UpstreamHandler: ChannelInboundHandler {
         }
         guard hadPending else { return }
         if head == nil {
-            respond(channel: clientChannel, status: .badGateway, message: reason)
+            respond(status: .badGateway, message: reason)
         } else {
-            clientChannel.close(promise: nil)
+            // Response đã bắt đầu stream và giờ bị cắt giữa chừng: vứt phần
+            // chưa flush là ĐÚNG Ý — client phải THẤY kết nối đứt, chứ không
+            // phải nhận một body cụt trông như đã xong.
+            client.closeDiscardingPendingWrites()
         }
     }
 
@@ -98,19 +129,21 @@ final class UpstreamHandler: ChannelInboundHandler {
         sink(.completed(id: transaction.id, Self.model(from: head, body: body), endedAt: Date()))
     }
 
-    private func respond(channel: Channel, status: HTTPResponseStatus, message: String) {
+    private func respond(status: HTTPResponseStatus, message: String) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Length", value: "\(message.utf8.count)")
         headers.add(name: "Content-Type", value: "text/plain; charset=utf-8")
-        channel.write(NIOAny(HTTPServerResponsePart.head(
+        // `write` chỉ trả false khi channel đã chết — lúc đó không có gì để
+        // đóng và cũng chưa có nửa response nào lọt ra ngoài, chỉ dừng lại.
+        guard client.write(.head(
             HTTPResponseHead(version: .http1_1, status: status, headers: headers)
-        )), promise: nil)
-        var buffer = channel.allocator.buffer(capacity: message.utf8.count)
+        ), flush: false) else { return }
+        var buffer = client.allocator.buffer(capacity: message.utf8.count)
         buffer.writeString(message)
-        channel.write(NIOAny(HTTPServerResponsePart.body(.byteBuffer(buffer))), promise: nil)
-        channel.writeAndFlush(NIOAny(HTTPServerResponsePart.end(nil))).whenComplete { _ in
-            channel.close(promise: nil)
-        }
+        guard client.write(.body(.byteBuffer(buffer)), flush: false) else { return }
+        // `writeThenClose`, không phải write + close: đóng ngay sau khi ghi sẽ
+        // vứt chính cái 502 vừa ghi nếu send buffer đang đầy.
+        client.writeThenClose(.end(nil))
     }
 
     private static func model(from head: HTTPResponseHead, body: BodyPayload) -> ResponseModel {

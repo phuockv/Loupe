@@ -69,7 +69,8 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
             guard !isFinished else {
                 // Client đã ngắt trong lúc connect còn đang bay: không còn ai
                 // dùng kết nối này — đóng luôn kẻo rò rỉ một socket không chủ.
-                peer.close()
+                // Chưa ghi gì vào nó nên không có phần chưa flush để mất.
+                peer.closeDiscardingPendingWrites()
                 return
             }
             upstream = peer
@@ -119,26 +120,41 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         }
     }
 
+    /// Client đóng kết nối. `closeAfterPendingWrites` chứ không phải đóng
+    /// thẳng: phần byte ta ĐÃ nhận từ client và đã chuyển cho upstream có thể
+    /// còn kẹt trong `pendingWrites` của upstream (origin đọc chậm hơn client
+    /// gửi). Đóng thẳng là vứt chúng — origin nhận một request TLS cụt trong
+    /// khi transaction `.tunnelled` không hiện gì bất thường.
     func channelInactive(context: ChannelHandlerContext) {
         isFinished = true
-        upstream?.close()
+        upstream?.closeAfterPendingWrites()
         upstream = nil
         buffered = []
         bufferedBytes = 0
         context.fireChannelInactive()
     }
 
+    /// Lỗi trên channel client. Báo cáo GIỐNG HỆT nhánh connect hỏng: với người
+    /// dùng thì cả hai đều là "tunnel này chết", nên cả hai phải phát `.failed`.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        guard !isFinished else { return }
+        sink(.failed(id: transactionID,
+                     message: "lỗi trên tunnel tới \(host):\(port) — \(error)",
+                     endedAt: Date()))
         abandon(clientChannel: context.channel)
     }
 
     /// Kết thúc tunnel từ phía ta: đóng cả hai đầu và bỏ phần còn đệm.
     /// KHÔNG phát `.failed` — người gọi tự quyết định có báo cáo hay không,
     /// vì "tunnel kết thúc" là chuyện bình thường khi hai đầu nói xong.
+    ///
+    /// Đây là đường HUỶ (connect hỏng, vượt trần buffer, lỗi, một chiều chết
+    /// giữa chừng), nên vứt phần chưa flush là đúng ý: tunnel đã hỏng rồi, đẩy
+    /// nốt một mẩu byte lẻ sang chỉ làm peer thấy dữ liệu cụt mà tưởng đủ.
     private func abandon(clientChannel: Channel) {
         guard !isFinished else { return }
         isFinished = true
-        upstream?.close()
+        upstream?.closeDiscardingPendingWrites()
         upstream = nil
         buffered = []
         bufferedBytes = 0
@@ -167,13 +183,20 @@ final class TunnelRelayHandler: ChannelInboundHandler {
         }
     }
 
+    /// Upstream đóng — với HTTP qua tunnel thì đây là kết thúc BÌNH THƯỜNG của
+    /// mọi lần tải xong. `closeAfterPendingWrites` chứ không phải đóng thẳng:
+    /// origin ghi nhanh hơn client đọc là chuyện mặc định ở mọi file lớn, nên
+    /// lúc này `pendingWrites` phía client thường vẫn còn đuôi của lần tải.
+    /// Đóng thẳng ở đây là cắt cụt file, im lặng, trên đường thành công.
     func channelInactive(context: ChannelHandlerContext) {
-        client.close()
+        client.closeAfterPendingWrites()
         context.fireChannelInactive()
     }
 
+    /// Lỗi thì ngược lại: dòng byte đã hỏng, đừng cố giao nốt phần đuôi của một
+    /// thứ không còn đúng — đóng thẳng để client THẤY nó đứt.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        client.close()
+        client.closeDiscardingPendingWrites()
         context.close(promise: nil)
     }
 }

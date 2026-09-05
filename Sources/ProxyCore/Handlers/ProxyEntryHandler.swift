@@ -75,6 +75,13 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
         // `HTTPRequestDecoder(responseEncoder:)`, nên nó không biết request là
         // CONNECT và sẽ tự thêm `transfer-encoding: chunked` cho một 200
         // không có transport header nào.
+        //
+        // ĐỪNG XOÁ DÒNG NÀY CHO "ĐÚNG RFC": RFC 9110 §9.3.6 nói response 2xx
+        // cho CONNECT không được mang Content-Length, nên nó trông thừa. Bỏ nó
+        // ra thì encoder thay bằng `transfer-encoding: chunked` — vi phạm CÙNG
+        // điều khoản đó VÀ nhét `0\r\n\r\n` vào byte đầu tiên của tunnel.
+        // Cách sửa đúng là ghép cặp encoder/decoder khi dựng pipeline; tới lúc
+        // đó thì mới bỏ được dòng này.
         var headers = HTTPHeaders()
         headers.add(name: "Content-Length", value: "0")
         context.write(wrapOutboundOut(.head(HTTPResponseHead(
@@ -90,9 +97,15 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
             case .success:
                 boundSelf.value.switchToTunnel(channel: channel, host: host, port: port,
                                                transaction: transaction, bypassed: bypassed)
-            case .failure:
+            case .failure(let error):
                 // Client ngắt trước khi nhận xong "200 Connection Established":
-                // không còn tunnel nào để dựng.
+                // không còn tunnel nào để dựng. Vẫn phải phát event kết thúc —
+                // `.started` đã đi rồi, im lặng ở đây để lại một transaction
+                // treo vĩnh viễn trong UI.
+                boundSelf.value.sink(.failed(
+                    id: transaction.id,
+                    message: "client ngắt trước khi nhận xong response CONNECT — \(error)",
+                    endedAt: Date()))
                 channel.close(promise: nil)
             }
         }
@@ -121,6 +134,14 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
     private func switchToTunnel(channel: Channel, host: String, port: Int,
                                 transaction: Transaction, bypassed: Bool) {
         let pipeline = channel.pipeline.syncOperations
+        // Gỡ `proxy` ở vòng này chạy `HTTPProxyHandler.handlerRemoved`, và hàm
+        // đó bật lại `autoRead` rồi gọi `channel.read()` — TRƯỚC khi handler
+        // tunnel được lắp vài dòng dưới. An toàn vì `read()` của NIOPosix chỉ
+        // đăng ký quan tâm readable rồi trả về (`readPending = true` +
+        // `registerForReadable`); byte thật chỉ được giao ở vòng selector kế
+        // tiếp, mà cả khối này chạy đồng bộ trong MỘT task. Nếu ai đó tách khối
+        // này ra thành nhiều lượt event loop thì ràng buộc đó mất, và byte
+        // client sẽ tới lúc pipeline không còn ai nhận.
         for handler in httpHandlers {
             pipeline.removeHandler(handler, promise: nil)
         }

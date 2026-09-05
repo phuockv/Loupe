@@ -285,6 +285,64 @@ struct ConnectTunnelTests {
         try await client.close()
     }
 
+    /// Byte đi CHUNG một gói với CONNECT là trường hợp mà cả đoạn gỡ pipeline
+    /// sinh ra để phục vụ, và là trường hợp DUY NHẤT chạy qua nhánh forwarding
+    /// của `leftOverBytesStrategy: .forwardBytes`.
+    ///
+    /// Ba test kia đều kết thúc lần ghi đúng ở `\r\n\r\n` rồi chờ response,
+    /// nên lúc decoder bị gỡ thì `readableBytes == 0` và nhánh đó không hề chạy.
+    /// Với HTTPS thật thì đây không phải ca hiếm: nó chính là ClientHello đi
+    /// cùng gói với CONNECT — thứ Task 8 sẽ phụ thuộc vào.
+    @Test("Byte gửi chung một gói với CONNECT vẫn được relay, và relay trước byte gửi sau")
+    func relaysBytesArrivingInTheSameWriteAsConnect() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let origin = try await startByteEchoServer(group: group)
+        defer { origin.close(promise: nil) }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = ["127.0.0.1"]
+
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let (client, collector) = try await connectRawClient(group: group, proxyPort: proxyPort)
+
+        // MỘT lần writeAndFlush duy nhất: CONNECT dính liền payload. Proxy đọc
+        // cả hai trong cùng một lượt, decoder dừng parse sau CONNECT (llhttp
+        // đánh dấu CONNECT là upgrade) và giữ phần đuôi lại, nên phần đuôi chỉ
+        // ra khỏi decoder qua đúng nhánh `.forwardBytes` lúc nó bị gỡ.
+        let inSameWrite = Data("leftover-di-cung-goi-voi-CONNECT".utf8)
+        var packet = Data("""
+        CONNECT 127.0.0.1:\(originPort) HTTP/1.1\r
+        Host: 127.0.0.1:\(originPort)\r
+        \r
+
+        """.utf8)
+        packet.append(inSameWrite)
+
+        let expectedResponse = Self.expectedConnectResponse
+        let responseFuture = expect(expectedResponse.utf8.count, from: collector, on: client)
+        try await write(packet, to: client)
+        #expect(String(decoding: try await responseFuture.get(), as: UTF8.self) == expectedResponse)
+
+        let leftoverEcho = expect(inSameWrite.count, from: collector, on: client)
+        #expect(try await leftoverEcho.get() == inSameWrite)
+
+        // Gửi tiếp sau khi tunnel đã dựng xong: phải về SAU phần leftover, tức
+        // thứ tự byte qua tunnel không bị đảo bởi bước replay buffer.
+        let afterHandover = Data("gui-sau-khi-tunnel-da-dung".utf8)
+        let afterEcho = expect(afterHandover.count, from: collector, on: client)
+        try await write(afterHandover, to: client)
+        #expect(try await afterEcho.get() == afterHandover)
+
+        try await client.close()
+    }
+
     /// Nhánh KHÔNG bypass đi qua đúng cùng một đoạn gỡ pipeline rồi mới rẽ
     /// sang `beginMITM`. Task 8 sẽ thay thân hàm đó, nhưng tới lúc ấy thì mọi
     /// host HTTPS không nằm trong bypass list đều chạy qua đây — nên đường này

@@ -53,7 +53,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
         var isActive: Bool { peer.isActive }
 
-        func close() { peer.close() }
+        /// Vứt luôn phần chưa flush là ĐÚNG Ý ở đây: cả bốn chỗ gọi đều đang bỏ
+        /// kết nối này (đổi target, client ngắt, handler bị gỡ, hoặc connect
+        /// xong khi không còn ai cần nó). Phần request còn kẹt trong
+        /// `pendingWrites` mà tới được origin thì nó là một request CỤT — tệ
+        /// hơn là không tới.
+        func close() { peer.closeDiscardingPendingWrites() }
 
         /// Ghi một part ra upstream; trả `false` — và KHÔNG ghi gì — nếu
         /// channel đã chết. Cố ý KHÔNG `@discardableResult`: bỏ qua giá trị

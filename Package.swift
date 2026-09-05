@@ -23,6 +23,8 @@ let package = Package(
             "TrafficModel",
             .product(name: "X509", package: "swift-certificates"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
+            .product(name: "Crypto", package: "swift-crypto"),
+            .product(name: "SwiftASN1", package: "swift-asn1"),
         ]),
         .target(name: "ProxyCore", dependencies: [
             "TrafficModel", "CertKit",

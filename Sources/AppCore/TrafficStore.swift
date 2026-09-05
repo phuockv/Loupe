@@ -55,9 +55,15 @@ public final class TrafficStore {
     }
 
     /// Tiêu thụ stream của engine, flush mỗi 100 ms. Trả về `Task` để nơi
-    /// gọi (Task 11) huỷ khi view biến mất; vòng lặp tự kiểm tra
-    /// `Task.isCancelled` vì `AsyncStream` không tự ngắt theo cancellation
-    /// của Task đang đọc nó.
+    /// gọi (Task 11) huỷ khi view biến mất: `for await` trên `AsyncStream`
+    /// đã cancellation-aware sẵn (đã kiểm chứng thực nghiệm trên toolchain
+    /// này) — huỷ `Task` này khiến vòng lặp thoát ngay, không cần tự kiểm
+    /// `Task.isCancelled` trong thân vòng lặp.
+    ///
+    /// Điều KHÔNG đúng: bản thân stream không bao giờ tự kết thúc, vì
+    /// `ProxyServer` không gọi `continuation.finish()` ở `stop()`/
+    /// `shutdown()`. Đó là một khoảng hở thật nhưng thuộc về task sở hữu
+    /// vòng đời `ProxyServer`, không phải ở đây.
     public func consume(_ events: AsyncStream<TrafficEvent>) -> Task<Void, Never> {
         Task { @MainActor in
             let ticker = Task { @MainActor in
@@ -68,7 +74,6 @@ public final class TrafficStore {
             }
             defer { ticker.cancel() }
             for await event in events {
-                if Task.isCancelled { break }
                 self.enqueue(event)
             }
             self.flushNow()
@@ -82,9 +87,9 @@ public final class TrafficStore {
         pending = []
     }
 
-    /// Áp một event vào `transactions`. Ba trong bốn case cập nhật chỉ
-    /// chạm transaction đã tồn tại qua `index`; nếu id chưa từng thấy,
-    /// event bị BỎ QUA thay vì bịa ra một `Transaction` giả.
+    /// Áp một event vào `transactions`. Cả bốn case còn lại ngoài
+    /// `.started` đều chỉ chạm transaction đã tồn tại qua `index`; nếu id
+    /// chưa từng thấy, event bị BỎ QUA thay vì bịa ra một `Transaction` giả.
     ///
     /// Lý do: `ProxyServer` dựng stream với `.bufferingNewest(10_000)`,
     /// nghĩa là dưới tải nặng nó rớt phần tử CŨ NHẤT trước — `.started`

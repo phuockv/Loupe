@@ -1,11 +1,91 @@
 import NIOCore
 
+/// Cờ "chiều RA của channel này đã đóng chưa", sống trên ĐÚNG một channel.
+///
+/// Vì sao nó phải là một handler trong pipeline chứ không phải một field của
+/// `GuardedPeer`: `GuardedPeer` là struct, và CÙNG một channel bị bọc bởi
+/// NHIỀU giá trị struct khác nhau ở các handler khác nhau —
+/// `ConnectTunnelHandler.client` và `TunnelRelayHandler.client` là hai giá trị
+/// riêng biệt cùng trỏ vào channel client. Một cờ cục bộ chỉ đúng cho đúng bản
+/// sao đã đặt nó; bản sao kia vẫn tưởng ghi được. Trạng thái vì thế phải suy ra
+/// từ CHANNEL, và pipeline là chỗ duy nhất gắn được trạng thái vào một channel.
+///
+/// Cờ được đặt bằng HAI đường, thừa một cách cố ý:
+///
+/// 1. `GuardedPeer.closeAfterPendingWrites` đặt NGAY lúc quyết định nửa-đóng,
+///    tức từ chối ghi mới trong CẢ giai đoạn xả. Đúng ý chứ không phải bảo thủ
+///    quá mức: đã quyết kết thúc chiều ra thì byte mới không còn chỗ để đi, và
+///    mọi đường tới đây đều là "chân đối diện đã chết".
+/// 2. `ChannelEvent.outputClosed` — sự kiện NIO bắn khi `shutdown(how: .WR)`
+///    thật sự xảy ra (`BaseStreamSocketChannel.close0` bắn nó ở cả nhánh đóng
+///    ngay lẫn nhánh đóng sau khi xả xong). Đường này bắt cả trường hợp ai đó
+///    nửa-đóng channel KHÔNG qua `GuardedPeer` — đáng kể với Task 8, vì
+///    `NIOSSLHandler` biến `close(mode: .output)` thành close_notify và forward
+///    `outputClosed` qua nhánh `default` của `userInboundEventTriggered`.
+///
+/// `@unchecked Sendable` có cơ sở chứ không phải để làm ngơ: mọi lần đọc/ghi cờ
+/// đều nằm trên event loop của channel — `userInboundEventTriggered` theo định
+/// nghĩa, còn hai lối kia đi qua `GuardedPeer`, mà `GuardedPeer.init` BẮT BUỘC
+/// chạy trên event loop đó (`pipeline.syncOperations` precondition điều đó) và
+/// `write` assert lại.
+final class OutputLiveness: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = NIOAny
+
+    private(set) var isOutputClosed = false
+
+    /// Lấy bản theo dõi của channel này, lắp mới nếu chưa có.
+    ///
+    /// Dùng lại bản đã có là BẮT BUỘC chứ không phải tối ưu: một channel client
+    /// HTTP keep-alive dựng một `GuardedPeer` mới cho MỖI kết nối upstream, nên
+    /// lắp mới mỗi lần là rò handler vào pipeline theo số transaction.
+    static func attached(to channel: Channel) -> OutputLiveness {
+        let pipeline = channel.pipeline.syncOperations
+        if let existing = try? pipeline.handler(type: OutputLiveness.self) {
+            return existing
+        }
+        let fresh = OutputLiveness()
+        do {
+            // `.first`: sự kiện inbound đi từ head xuống, nên đứng ngay sau head
+            // là chỗ không handler nào chen lên trước để nuốt `outputClosed`.
+            try pipeline.addHandler(fresh, position: .first)
+        } catch {
+            // Pipeline không nhận handler nghĩa là channel đã đóng hẳn. Ngả về
+            // phía AN TOÀN: coi như không ghi được nữa. Ngả về phía kia là đúng
+            // lớp bug mà cả file này sinh ra để chặn.
+            fresh.isOutputClosed = true
+        }
+        return fresh
+    }
+
+    func markOutputClosed() {
+        isOutputClosed = true
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        switch event {
+        case ChannelEvent.outputClosed:
+            isOutputClosed = true
+        default:
+            break
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+}
+
 /// Một channel "phía bên kia" mà handler này ghi vào, với `Channel` bị giấu kín.
 ///
 /// Đây là bản cài đặt DUY NHẤT của phép kiểm liveness trước khi ghi: `channel`
 /// để `private` nên không có cách nào lấy nó ra để ghi thẳng, và
-/// `write(_:flush:)` — chỗ duy nhất ghi được — vừa giữ kiểm tra `isActive` vừa
+/// `write(_:flush:)` — chỗ duy nhất ghi được — vừa giữ phép kiểm liveness vừa
 /// trả về một `Bool` KHÔNG `@discardableResult`.
+///
+/// Phép kiểm đó là HAI vế, không phải một. `isActive` KHÔNG đủ: một channel vừa
+/// bị `closeAfterPendingWrites` nửa-đóng chiều ra vẫn `isActive == true` —
+/// `close0(mode: .output)` không đụng tới `lifecycleManager` — trong khi
+/// `BaseStreamSocketChannel.bufferPendingWrite` đã bắt đầu bằng
+/// `if self.outputShutdown { promise?.fail(...); return }`. Với `promise: nil`
+/// thì đó là một byte biến mất im lặng và một `write` trả `true`. Vế thứ hai
+/// (`OutputLiveness`) đóng đúng cái cửa đó.
 ///
 /// PHẠM VI nó thật sự khoá được, nói cho đúng: các peer ĐƯỢC LƯU trong
 /// `HTTPProxyHandler` (qua `UpstreamConnection`), `UpstreamHandler`,
@@ -36,9 +116,20 @@ import NIOCore
 /// Cả ba kiểu đang dùng đều thoả.
 struct GuardedPeer<Part: Sendable> {
     private let channel: Channel
+    private let output: OutputLiveness
 
+    /// PHẢI chạy trên event loop của `channel` — `pipeline.syncOperations`
+    /// precondition điều đó, nên vi phạm là crash ngay tại chỗ dựng chứ không
+    /// phải một cuộc đua âm thầm sau này.
+    ///
+    /// Đó không phải phiền toái thêm vào: mọi chỗ dựng `GuardedPeer` trong
+    /// ProxyCore đều nằm trong callback của một handler hoặc trong
+    /// `channelInitializer` của một bootstrap ghim vào đúng loop ấy (upstream
+    /// luôn `ClientBootstrap(group: context.eventLoop)`). Và chính ràng buộc
+    /// này là thứ cho phép `OutputLiveness` không cần khoá.
     init(channel: Channel) {
         self.channel = channel
+        self.output = OutputLiveness.attached(to: channel)
     }
 
     var isActive: Bool { channel.isActive }
@@ -48,17 +139,25 @@ struct GuardedPeer<Part: Sendable> {
     var allocator: ByteBufferAllocator { channel.allocator }
 
     /// Ghi một part ra peer; trả `false` — và KHÔNG ghi gì — nếu channel đã
-    /// chết. Cố ý KHÔNG `@discardableResult`: bỏ qua giá trị trả về chính là
-    /// bỏ qua tín hiệu mà cả lớp bug này xoay quanh.
+    /// chết HOẶC chiều ra của nó đã đóng. Cố ý KHÔNG `@discardableResult`: bỏ
+    /// qua giá trị trả về chính là bỏ qua tín hiệu mà cả lớp bug này xoay quanh.
     ///
     /// `promise: nil` là chủ ý cho đường nóng (một promise cho mỗi gói tin
-    /// relay là một cấp phát cho mỗi gói tin), nhưng nó có một hệ quả PHẢI
-    /// biết: `flush` chỉ là yêu cầu, byte có thể còn nằm trong `pendingWrites`
-    /// nếu send buffer của socket đã đầy. Vì thế "ghi xong rồi đóng" phải dùng
-    /// `writeThenClose` hoặc `closeAfterPendingWrites`, KHÔNG phải
-    /// `closeDiscardingPendingWrites`.
+    /// relay là một cấp phát cho mỗi gói tin), nhưng nó có hai hệ quả PHẢI biết:
+    ///
+    /// - `flush` chỉ là yêu cầu, byte có thể còn nằm trong `pendingWrites` nếu
+    ///   send buffer của socket đã đầy. Vì thế "ghi xong rồi đóng" phải dùng
+    ///   `writeThenClose` hoặc `closeAfterPendingWrites`, KHÔNG phải
+    ///   `closeDiscardingPendingWrites`.
+    /// - Không có promise thì mọi thất bại NIO báo qua promise đều không đi đâu
+    ///   cả. `true` ở đây vì thế chỉ có nghĩa "NIO đã NHẬN part vào hàng đợi
+    ///   ghi", không phải "byte đã tới nơi". Phần bị vứt SAU khi đã nhận là
+    ///   trách nhiệm của bên đóng: `closeDiscardingPendingWrites` mang cái tên
+    ///   dài đó vì lý do này, và watchdog xả trong `closeAfterPendingWrites`
+    ///   bắt buộc phải báo cáo phần nó vứt.
     func write(_ part: Part, flush: Bool) -> Bool {
-        guard channel.isActive else { return false }
+        channel.eventLoop.assertInEventLoop()
+        guard channel.isActive, !output.isOutputClosed else { return false }
         if flush {
             channel.writeAndFlush(part, promise: nil)
         } else {
@@ -78,7 +177,7 @@ struct GuardedPeer<Part: Sendable> {
     /// làm. Mọi lần ghi khác phải qua `write(_:flush:)` và phải xử lý `false`.
     func writeThenClose(_ part: Part) {
         let channel = self.channel
-        guard channel.isActive else {
+        guard channel.isActive, !output.isOutputClosed else {
             channel.close(promise: nil)
             return
         }
@@ -136,6 +235,7 @@ extension GuardedPeer where Part == ByteBuffer {
     ///   ĐỨNG IM: mỗi chu kỳ so `bufferedWritableBytes` với lần trước, còn tụt
     ///   thì cho đi tiếp, đứng nguyên trọn một chu kỳ mới bỏ cuộc. Client chậm
     ///   mà vẫn tiến thì chờ bao lâu cũng được; client chết cứng thì vẫn có trần.
+    ///   Và khi nó bỏ cuộc thì nó BÁO — xem `onDrainAbandoned`.
     /// - **Nán** (`lingerTimeout`): sau khi FIN của ta đã đi, ta chỉ còn chờ peer
     ///   đóng nốt chiều của nó. Hết hạn ở đây KHÔNG mất gì — byte của ta đã ra
     ///   hết socket — nên một hạn cố định là đủ.
@@ -151,20 +251,50 @@ extension GuardedPeer where Part == ByteBuffer {
     /// Vẫn ràng buộc `Part == ByteBuffer` dù giờ không còn ghi gì: nửa-đóng
     /// chiều ra là ngữ nghĩa của TUNNEL. Với một channel HTTP thì nó sai — sau
     /// khi FIN đi rồi ta không còn nói được gì với client nữa, kể cả một lỗi.
+    ///
+    /// `onDrainAbandoned` KHÔNG có giá trị mặc định, cùng lý do với việc `write`
+    /// không `@discardableResult`: bỏ cuộc giữa lúc xả là CẮT CỤT, và một lần
+    /// cắt cụt không ai kể lại thì transaction vẫn hiện `.tunnelled` sạch sẽ —
+    /// đúng lớp bug cả file này sinh ra để chặn. Người gọi buộc phải nói ra nó
+    /// báo cho ai. Tham số nhận số byte bị vứt (`bufferedWritableBytes` tại thời
+    /// điểm bỏ cuộc); nó KHÔNG kể phần đã nằm trong send buffer của kernel mà
+    /// RST làm bay theo, nên nó là cận DƯỚI của thiệt hại.
     func closeAfterPendingWrites(stallTimeout: TimeAmount = .seconds(15),
-                                 lingerTimeout: TimeAmount = .seconds(15)) {
+                                 lingerTimeout: TimeAmount = .seconds(15),
+                                 onDrainAbandoned: @escaping (Int) -> Void) {
         let channel = self.channel
+        channel.eventLoop.assertInEventLoop()
         guard channel.isActive else {
             channel.close(promise: nil)
             return
         }
+        guard !output.isOutputClosed else {
+            // Đã có một lượt nửa-đóng cho channel này. KHÔNG được đóng cứng
+            // chồng lên: lượt đầu có thể đang xả, và cắt ngang nó chính là cái
+            // mất byte cả hàm này sinh ra để tránh. Lượt đầu cũng đã hẹn giờ
+            // nán, nên không có gì bị bỏ dở.
+            return
+        }
+        // Từ NGAY đây mọi `write` vào peer này trả `false` thay vì im lặng biến
+        // mất — kể cả `write` gọi qua một giá trị `GuardedPeer` KHÁC đang bọc
+        // cùng channel (xem `OutputLiveness`).
+        output.markOutputClosed()
 
         let progress = DrainProgress()
+        let abandonReport = NIOLoopBoundBox(onDrainAbandoned, eventLoop: channel.eventLoop)
         let stallWatchdog = channel.eventLoop.scheduleRepeatedTask(
             initialDelay: stallTimeout, delay: stallTimeout
         ) { task in
             // `syncOptions` hợp lệ ở đây: callback của scheduleRepeatedTask luôn
             // chạy trên event loop của chính channel này.
+            //
+            // Không đọc được số byte còn tồn thì không còn cách nào ràng buộc
+            // giai đoạn xả, nên watchdog tự rút. Đường tới đây là channel đã
+            // đóng hẳn (`getOption0` ném `ioOnClosedChannel`) — lúc đó không còn
+            // gì để canh. Đường "channel còn sống mà option không hỗ trợ" thì
+            // KHÔNG có với socket thật; test `stalledDrainIsCutAndReported` ghim
+            // đúng nhánh còn lại, vì nếu nhánh này nuốt mọi tick thì trần chống
+            // treo biến mất mà không test nào đỏ.
             guard let pending = (try? channel.syncOptions?.getOption(.bufferedWritableBytes)) ?? nil
             else {
                 task.cancel()
@@ -172,10 +302,18 @@ extension GuardedPeer where Part == ByteBuffer {
             }
             if pending == 0 || pending < progress.lastPending {
                 progress.lastPending = pending
-            } else {
-                task.cancel()
-                channel.close(promise: nil)
+                return
             }
+            task.cancel()
+            // Đóng CỨNG giữa lúc xả: `close0(mode: .all)` gọi
+            // `cancelWritesOnClose` (vứt `pendingWrites`), và vì chiều vào
+            // thường còn dữ liệu chưa đọc thì kernel gửi RST, vứt luôn send
+            // buffer. `pending` byte này KHÔNG tới nơi.
+            //
+            // Báo TRƯỚC khi đóng: đóng có thể chạy đồng bộ vào các đường dọn
+            // dẹp khác, và ta muốn sự kiện này là thứ mô tả nguyên nhân.
+            abandonReport.value(pending)
+            channel.close(promise: nil)
         }
 
         let outputClosed = channel.eventLoop.makePromise(of: Void.self)

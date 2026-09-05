@@ -138,11 +138,34 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// khi transaction `.tunnelled` không hiện gì bất thường.
     func channelInactive(context: ChannelHandlerContext) {
         isFinished = true
-        upstream?.closeAfterPendingWrites()
+        drainUpstream()
         upstream = nil
         buffered = []
         bufferedBytes = 0
         context.fireChannelInactive()
+    }
+
+    /// Nửa-đóng chiều ra của upstream sau khi xả nốt. Watchdog xả có thể BỎ CUỘC
+    /// và đóng cứng giữa chừng — khi đó nó cắt cụt đúng cái request TLS mà lần
+    /// xả này sinh ra để bảo vệ, nên nó phải phát `.failed` chứ không được im
+    /// lặng. Đó là lý do `onDrainAbandoned` không có giá trị mặc định.
+    private func drainUpstream() {
+        upstream?.closeAfterPendingWrites(
+            onDrainAbandoned: { [reporter = self.reporter, host = self.host, port = self.port] discarded in
+                reporter.reportFailure(
+                    "tunnel tới \(host):\(port) bị cắt trong lúc dọn: upstream ngừng nhận trọn "
+                    + "một chu kỳ, ít nhất \(discarded) byte client đã gửi không tới được origin")
+            })
+    }
+
+    /// Ảnh gương của `drainUpstream` cho chân client.
+    private func drainClient() {
+        client?.closeAfterPendingWrites(
+            onDrainAbandoned: { [reporter = self.reporter, host = self.host, port = self.port] discarded in
+                reporter.reportFailure(
+                    "tunnel tới \(host):\(port) bị cắt trong lúc dọn: client ngừng nhận trọn "
+                    + "một chu kỳ, ít nhất \(discarded) byte đã nhận từ origin không tới được client")
+            })
     }
 
     /// Lỗi trên channel CLIENT. Báo cáo GIỐNG HỆT nhánh connect hỏng: với người
@@ -158,7 +181,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         isFinished = true
         buffered = []
         bufferedBytes = 0
-        upstream?.closeAfterPendingWrites()
+        drainUpstream()
         upstream = nil
         client?.closeDiscardingPendingWrites()
     }
@@ -184,7 +207,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         upstream = nil
         buffered = []
         bufferedBytes = 0
-        client?.closeAfterPendingWrites()
+        drainClient()
     }
 
     /// Kết thúc tunnel từ phía ta: đóng cả hai đầu và bỏ phần còn đệm.
@@ -219,10 +242,16 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     /// `ConnectTunnelHandler.client`: `closeAfterPendingWrites` chỉ tồn tại
     /// trên `GuardedPeer<ByteBuffer>`, và đó là ràng buộc muốn giữ.
     private var upstream: GuardedPeer<ByteBuffer>?
-    /// Chỉ để BÁO CÁO. Đây là con số duy nhất ta biết chắc về một tunnel mù, và
-    /// nó là thứ hữu ích nhất còn lại khi phải nói "có lỗi nhưng không rõ nội
-    /// dung đã xong hay chưa".
+    /// Chỉ để BÁO CÁO, và chỉ đếm phần channel client ĐÃ NHẬN — cộng dồn trước
+    /// khi ghi thì mỗi buffer bị `client.write` từ chối vẫn được tính, và con
+    /// số ta trích dẫn trong `.failed` thành ra to hơn thứ thật sự đã chuyển.
+    /// Với một tunnel mù thì đây là con số duy nhất ta biết chắc, nên nó không
+    /// được phép nói quá.
     private var bytesRelayedToClient = 0
+    /// Tunnel đã kết thúc ở chân này. Ảnh gương của
+    /// `ConnectTunnelHandler.isFinished`: chặn đếm tiếp sau khi client đã biến
+    /// mất, và chặn xếp hàng hai lượt nửa-đóng cho cùng một channel.
+    private var isFinished = false
 
     init(client: GuardedPeer<ByteBuffer>, reporter: TunnelReporter) {
         self.client = client
@@ -234,16 +263,20 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        bytesRelayedToClient += unwrapInboundIn(data).readableBytes
-        if !client.write(unwrapInboundIn(data), flush: true) {
+        guard !isFinished else { return }
+        let buffer = unwrapInboundIn(data)
+        guard client.write(buffer, flush: true) else {
             // Client đã biến mất. Đóng phía upstream có drain, không đóng
             // thẳng: nó có thể đang giữ byte client đã gửi mà origin chưa đọc
             // hết — kể cả phần `ConnectTunnelHandler.channelInactive` vừa xếp
             // hàng để drain khi client ngắt. Đây là ảnh gương của
             // `upstreamVanished()`, và đóng thẳng ở đây là cắt cụt đúng cái
             // request TLS mà chú thích bên kia sinh ra để bảo vệ.
-            upstream?.closeAfterPendingWrites()
+            isFinished = true
+            drainUpstream()
+            return
         }
+        bytesRelayedToClient += buffer.readableBytes
     }
 
     /// Upstream đóng — với HTTP qua tunnel thì đây là kết thúc BÌNH THƯỜNG của
@@ -252,8 +285,32 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     /// lúc này `pendingWrites` phía client thường vẫn còn đuôi của lần tải.
     /// Đóng thẳng ở đây là cắt cụt file, im lặng, trên đường thành công.
     func channelInactive(context: ChannelHandlerContext) {
-        client.closeAfterPendingWrites()
+        if !isFinished {
+            isFinished = true
+            drainClient()
+        }
         context.fireChannelInactive()
+    }
+
+    /// Nửa-đóng chiều ra của client sau khi xả nốt, và BÁO nếu watchdog xả bỏ
+    /// cuộc. Cắt cụt ở đây là cắt cụt đuôi một lần tải, trên đường thành công —
+    /// đúng thứ không được phép xảy ra trong im lặng.
+    private func drainClient() {
+        client.closeAfterPendingWrites(
+            onDrainAbandoned: { [reporter = self.reporter] discarded in
+                reporter.reportFailure(
+                    "tunnel bị cắt trong lúc dọn: client ngừng nhận trọn một chu kỳ, "
+                    + "ít nhất \(discarded) byte đã nhận từ origin không tới được client")
+            })
+    }
+
+    private func drainUpstream() {
+        upstream?.closeAfterPendingWrites(
+            onDrainAbandoned: { [reporter = self.reporter] discarded in
+                reporter.reportFailure(
+                    "tunnel bị cắt trong lúc dọn: upstream ngừng nhận trọn một chu kỳ, "
+                    + "ít nhất \(discarded) byte client đã gửi không tới được origin")
+            })
     }
 
     /// Lỗi trên channel UPSTREAM. Phía client vẫn đóng CÓ DRAIN, không đóng
@@ -283,17 +340,30 @@ final class TunnelRelayHandler: ChannelInboundHandler {
         // một FIN đàng hoàng CÒN bản ghi hiện một tunnel sạch sẽ — tức công cụ
         // nói dối, đúng thứ cả file này sinh ra để chặn.
         //
-        // Message nêu đúng thứ ta BIẾT và nói rõ thứ ta KHÔNG biết: tunnel mù
-        // không nhìn được vào trong dòng TLS, nên handler này không có cách nào
-        // phân biệt "reset vô hại sau khi origin đã gửi xong" với "origin chết
-        // giữa chừng". Đoán bừa trong text sự kiện còn tệ hơn im lặng; nêu số
-        // byte đã chuyển được là dữ kiện thật và dùng được.
+        // Message chỉ nói thứ ta BIẾT, và mọi thứ nó không biết thì nói ra là
+        // không biết. Tunnel mù không nhìn được vào trong dòng TLS nên handler
+        // này không phân biệt được "reset vô hại sau khi origin đã gửi xong" với
+        // "origin chết giữa chừng" — vì thế tiêu đề KHÔNG được nói "giữa tunnel",
+        // đó là khẳng định đúng cái điều hai dòng dưới thừa nhận là không biết.
+        //
+        // Con số byte cũng chỉ được nêu ở đúng mức nó đúng: nó là phần channel
+        // client ĐÃ NHẬN vào hàng đợi ghi. Nói thêm rằng "số byte đó vẫn được
+        // giao nốt" là bịa: `closeAfterPendingWrites` ngay dưới có thể bị
+        // watchdog xả cắt ngang, và khi đó phần còn tồn bị vứt.
         reporter.reportFailure(
-            "upstream lỗi giữa tunnel — \(error); đã chuyển \(bytesRelayedToClient) byte "
-            + "về client và số byte đó vẫn được giao nốt. Tunnel mù không đọc được nội dung "
-            + "nên không phân biệt được origin đã gửi xong hay bị cắt giữa chừng."
+            "lỗi ở chân upstream của tunnel — \(error); đã chuyển được "
+            + "\(bytesRelayedToClient) byte sang channel client (chưa chắc đã ra hết tới "
+            + "client: phần còn tồn đang được xả và có thể bị cắt nếu client ngừng nhận). "
+            + "Tunnel mù không đọc được nội dung nên không phân biệt được origin đã gửi "
+            + "xong hay bị cắt giữa chừng."
         )
-        client.closeAfterPendingWrites()
+        // Báo thì vẫn báo (chốt at-most-once nằm trong `TunnelReporter`), nhưng
+        // DỌN thì không làm lại. Lượt dọn trước — chân client biến mất ở
+        // `channelRead` — đã xếp một lần nửa-đóng CÓ XẢ cho upstream, và
+        // `context.close` dưới đây sẽ cắt ngang đúng lượt xả đó.
+        guard !isFinished else { return }
+        isFinished = true
+        drainClient()
         context.close(promise: nil)
     }
 }

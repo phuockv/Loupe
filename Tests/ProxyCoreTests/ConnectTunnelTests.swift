@@ -198,6 +198,291 @@ struct ConnectTunnelTests {
         try await channel.writeAndFlush(buffer)
     }
 
+    /// Một cặp channel loopback THẬT. `near` là đầu ta bọc trong `GuardedPeer`
+    /// (vai "peer của proxy"), `far` là đầu kia.
+    ///
+    /// Không dùng `EmbeddedChannel` cho bất cứ thứ gì liên quan tới nửa-đóng:
+    /// `EmbeddedChannel.close0` bỏ qua `CloseMode` và luôn đóng HẲN, nên nó sẽ
+    /// quan sát nhầm đúng thứ đang cần kiểm.
+    struct LoopbackPair: Sendable {
+        let near: Channel
+        let far: Channel
+        let listener: Channel
+        let farBytes: RawByteCollector
+
+        func closeAll() {
+            near.close(promise: nil)
+            far.close(promise: nil)
+            listener.close(promise: nil)
+        }
+    }
+
+    /// - Parameters:
+    ///   - farEndReads: `false` tắt `autoRead` ở đầu kia và không ai gọi
+    ///     `read()`, tức nó KHÔNG BAO GIỜ đọc — cách duy nhất làm
+    ///     `bufferedWritableBytes` đứng im theo cấu tạo thay vì theo may rủi.
+    ///   - farEndAllowsHalfClosure: bật thì đầu kia KHÔNG tự đóng khi nhận FIN
+    ///     của ta (mặc định của NIO là đóng hẳn), nên "peer không đóng chiều của
+    ///     nó" mới dựng được.
+    private func makeLoopbackPair(
+        on loop: EventLoop, farEndReads: Bool, farEndAllowsHalfClosure: Bool,
+        farEndReceiveBufferBytes: Int? = nil, nearEndSendBufferBytes: Int? = nil
+    ) async throws -> LoopbackPair {
+        let farBytes = RawByteCollector()
+        let accepted = loop.makePromise(of: Channel.self)
+        var server = ServerBootstrap(group: loop)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelOption(.autoRead, value: farEndReads)
+            .childChannelOption(.allowRemoteHalfClosure, value: farEndAllowsHalfClosure)
+            .childChannelInitializer { channel in
+                accepted.succeed(channel)
+                return channel.pipeline.addHandler(farBytes)
+            }
+        if let farEndReceiveBufferBytes {
+            server = server.childChannelOption(
+                .socketOption(.so_rcvbuf), value: SocketOptionValue(farEndReceiveBufferBytes))
+        }
+        let listener = try await server.bind(host: "127.0.0.1", port: 0).get()
+
+        var client = ClientBootstrap(group: loop)
+        if let nearEndSendBufferBytes {
+            client = client.channelOption(
+                .socketOption(.so_sndbuf), value: SocketOptionValue(nearEndSendBufferBytes))
+        }
+        let near = try await client.connect(
+            host: "127.0.0.1", port: listener.localAddress!.port!).get()
+        return LoopbackPair(near: near, far: try await accepted.futureResult.get(),
+                            listener: listener, farBytes: farBytes)
+    }
+
+    /// Chờ `channel` đóng HẲN, tối đa `timeout`; trả `false` nếu hết giờ. Có hạn
+    /// tường minh để một hồi quy làm channel treo thì test ĐỎ chứ không treo
+    /// theo. `succeed` lần thứ hai là no-op (`_setValue` chỉ nhận giá trị đầu).
+    private func closes(_ channel: Channel, within timeout: TimeAmount) async throws -> Bool {
+        let verdict = channel.eventLoop.makePromise(of: Bool.self)
+        channel.closeFuture.whenComplete { _ in verdict.succeed(true) }
+        channel.eventLoop.scheduleTask(in: timeout) { verdict.succeed(false) }
+        return try await verdict.futureResult.get()
+    }
+
+    /// `isActive` KHÔNG bắt được một channel đã nửa-đóng chiều ra:
+    /// `close0(mode: .output)` không đụng tới `lifecycleManager`, nên channel vẫn
+    /// `isActive == true`, trong khi `BaseStreamSocketChannel.bufferPendingWrite`
+    /// đã bắt đầu bằng `if outputShutdown { promise?.fail(...); return }`. Với
+    /// `promise: nil` thì đó là một byte biến mất im lặng và một `write` trả
+    /// `true` — đúng lớp bug `GuardedPeer` sinh ra để chặn, vào bằng cửa
+    /// `close()` mà doc comment của chính file đó cảnh báo.
+    ///
+    /// Hai `GuardedPeer` RIÊNG BIỆT cùng bọc một channel là hình dạng THẬT trong
+    /// production (`ConnectTunnelHandler.client` và `TunnelRelayHandler.client`),
+    /// và là lý do cờ không thể là field của struct: bản sao nào đóng thì chỉ
+    /// bản sao đó biết.
+    @Test("Nửa-đóng chiều ra: mọi GuardedPeer bọc channel đó đều từ chối ghi, kể cả bản sao khác")
+    func writesAreRefusedAfterOutputHalfClose() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        // (1) Nửa-đóng ĐI QUA `GuardedPeer`, còn lần ghi đi qua một giá trị
+        //     struct KHÁC bọc cùng channel.
+        let byGuard = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { byGuard.closeAll() }
+
+        let afterGuardedClose = try await loop.submit { () -> (refused: Bool, active: Bool) in
+            let closer = GuardedPeer<ByteBuffer>(channel: byGuard.near)
+            let writer = GuardedPeer<ByteBuffer>(channel: byGuard.near)
+            closer.closeAfterPendingWrites(
+                stallTimeout: .seconds(30), lingerTimeout: .seconds(30),
+                onDrainAbandoned: { _ in Issue.record("không có gì để xả, không được bỏ cuộc") })
+            var payload = byGuard.near.allocator.buffer(capacity: 8)
+            payload.writeString("sau-FIN")
+            return (writer.write(payload, flush: true), byGuard.near.isActive)
+        }.get()
+        #expect(afterGuardedClose.refused == false,
+                "write phải trả false, không được nuốt byte rồi báo là đã gửi")
+        #expect(afterGuardedClose.active,
+                "channel vẫn isActive — đây chính là chỗ phép kiểm chỉ-isActive nói 'ghi được'")
+
+        // (2) Nửa-đóng KHÔNG qua `GuardedPeer`. Task 8 lắp `NIOSSLHandler`, và
+        //     nó tự biến `close(mode: .output)` thành close_notify; chỉ
+        //     `ChannelEvent.outputClosed` báo được đường này.
+        let byChannel = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { byChannel.closeAll() }
+
+        let afterChannelClose = try await loop.submit { () -> (refused: Bool, active: Bool) in
+            let peer = GuardedPeer<ByteBuffer>(channel: byChannel.near)
+            // Hàng đợi ghi rỗng nên `pendingWrites.closeOutbound` trả
+            // `.readyForClose` ngay: `shutdown(how: .WR)` VÀ `outputClosed` chạy
+            // đồng bộ trong đúng lệnh này, không có lượt loop nào xen giữa.
+            byChannel.near.close(mode: .output, promise: nil)
+            var payload = byChannel.near.allocator.buffer(capacity: 8)
+            payload.writeString("sau-FIN")
+            return (peer.write(payload, flush: true), byChannel.near.isActive)
+        }.get()
+        #expect(afterChannelClose.refused == false)
+        #expect(afterChannelClose.active)
+    }
+
+    /// Watchdog xả: peer đứng im trọn một chu kỳ thì bị cắt — VÀ việc cắt phải
+    /// để lại một `.failed`.
+    ///
+    /// Trước vòng này KHÔNG một dòng nào trong thân watchdog được test nào chạy
+    /// qua: mọi test đều xong dưới ~1 s, tức nằm gọn trong hạn 15 s mặc định.
+    /// Nếu `getOption(.bufferedWritableBytes)` trả nil ở mọi tick thì `guard let`
+    /// đầu thân hàm rút watchdog và trần chống treo biến mất — mà 59/59 vẫn
+    /// xanh. Test này ghim cả hai nửa: watchdog CÓ chạy, và khi nó cắt thì nó
+    /// nói ra.
+    ///
+    /// TẤT ĐỊNH chứ không canh giờ: đầu kia KHÔNG BAO GIỜ đọc, nên khi buffer
+    /// nhận của nó và send buffer của ta đã đầy thì `bufferedWritableBytes` đứng
+    /// nguyên theo CẤU TẠO. Không có cuộc đua nào để thua.
+    @Test("Peer đứng im khi đang xả: watchdog cắt và phát .failed, không cắt cụt im lặng")
+    func stalledDrainIsCutAndReported() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let pair = try await makeLoopbackPair(
+            on: loop, farEndReads: false, farEndAllowsHalfClosure: true,
+            farEndReceiveBufferBytes: 16 * 1024, nearEndSendBufferBytes: 64 * 1024)
+        defer { pair.closeAll() }
+
+        let recorder = RecordingSink()
+        let transactionID = UUID()
+        // Nhiều hơn hẳn tổng hai buffer socket, nên phần tồn không bao giờ về 0.
+        let stuck = Data(repeating: 0x6B, count: 4 * 1024 * 1024)
+
+        try await loop.submit {
+            let reporter = TunnelReporter(transactionID: transactionID,
+                                          sink: { recorder.record($0) })
+            let peer = GuardedPeer<ByteBuffer>(channel: pair.near)
+            var buffer = pair.near.allocator.buffer(capacity: stuck.count)
+            buffer.writeBytes(stuck)
+            #expect(peer.write(buffer, flush: true), "channel còn sống, lần ghi này phải được nhận")
+            peer.closeAfterPendingWrites(
+                stallTimeout: .milliseconds(50), lingerTimeout: .seconds(30),
+                onDrainAbandoned: { discarded in
+                    reporter.reportFailure("bỏ cuộc khi đang xả, vứt \(discarded) byte")
+                })
+        }.get()
+
+        // Hạn nán để 30 s và peer không bao giờ đóng chiều của nó, nên đường
+        // DUY NHẤT đóng được channel này là watchdog xả.
+        #expect(try await closes(pair.near, within: .seconds(5)),
+                "watchdog xả phải cắt một peer đứng im")
+
+        let failures = try await loop.submit { () -> [(UUID, String)] in
+            recorder.events.compactMap {
+                if case .failed(let id, let message, _) = $0 { return (id, message) }
+                return nil
+            }
+        }.get()
+        #expect(failures.count == 1, "một lần cắt cụt phải để lại đúng một .failed")
+        #expect(failures.first?.0 == transactionID)
+        #expect(failures.first?.1.contains("bỏ cuộc khi đang xả") == true,
+                "message: \(failures.first?.1 ?? "-")")
+    }
+
+    /// Hạn NÁN là hạn riêng, không phải phần đuôi của hạn xả: nó phải nổ ngay cả
+    /// khi giai đoạn xả kết thúc hoàn hảo.
+    ///
+    /// Peer ở đây đọc HẾT (nên watchdog xả không có gì để cắt, và hạn xả 30 s
+    /// không bao giờ tới) nhưng KHÔNG BAO GIỜ đóng chiều của nó —
+    /// `allowRemoteHalfClosure` bật nên nó không tự đóng khi thấy FIN của ta.
+    /// Không có hạn nán thì channel này treo vĩnh viễn, im lặng, trên đường
+    /// THÀNH CÔNG.
+    @Test("Peer xả hết nhưng không đóng chiều của nó: hạn nán vẫn đóng channel")
+    func lingerClosesChannelAfterDrainCompletes() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let pair = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { pair.closeAll() }
+
+        let payload = Data("nan-cho-FIN-cua-peer".utf8)
+        let delivered = expect(payload.count, from: pair.farBytes, on: pair.far)
+
+        try await loop.submit {
+            let peer = GuardedPeer<ByteBuffer>(channel: pair.near)
+            var buffer = pair.near.allocator.buffer(capacity: payload.count)
+            buffer.writeBytes(payload)
+            #expect(peer.write(buffer, flush: true))
+            peer.closeAfterPendingWrites(
+                stallTimeout: .seconds(30), lingerTimeout: .milliseconds(50),
+                onDrainAbandoned: { _ in
+                    Issue.record("peer đọc hết, không được coi là đứng im")
+                })
+        }.get()
+
+        #expect(try await delivered.get() == payload, "giai đoạn xả phải hoàn tất trọn vẹn")
+        #expect(try await closes(pair.near, within: .seconds(5)),
+                "hạn nán phải đóng channel dù hạn xả còn 30 s và peer không gửi FIN")
+    }
+
+    /// `bytesRelayedToClient` là con số DUY NHẤT mà `.failed` của một tunnel mù
+    /// trích dẫn được, nên nó không được phép nói quá. Cộng dồn TRƯỚC khi ghi
+    /// thì mỗi buffer bị `client.write` từ chối vẫn được tính — bản ghi khai
+    /// khống đúng phần KHÔNG tới nơi, mà đó là lớp bug cả task này xoay quanh.
+    @Test("Byte bị client từ chối không được tính vào con số mà .failed trích dẫn")
+    func rejectedBytesAreNotCountedAsRelayed() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { Task { try? await group.shutdownGracefully() } }
+        let loop = group.next()
+
+        let clientSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { clientSide.closeAll() }
+        let upstreamSide = try await makeLoopbackPair(
+            on: loop, farEndReads: true, farEndAllowsHalfClosure: true)
+        defer { upstreamSide.closeAll() }
+
+        let recorder = RecordingSink()
+        let transactionID = UUID()
+        let accepted = Data("byte-nay-toi-noi".utf8)
+        let rejected = Data(repeating: 0x33, count: 4096)
+
+        try await loop.submit {
+            let reporter = TunnelReporter(transactionID: transactionID,
+                                          sink: { recorder.record($0) })
+            try upstreamSide.near.pipeline.syncOperations.addHandler(
+                TunnelRelayHandler(client: GuardedPeer(channel: clientSide.near),
+                                   reporter: reporter))
+
+            // Đi qua ĐÚNG đường relay thật, không ghi thẳng vào peer.
+            var first = upstreamSide.near.allocator.buffer(capacity: accepted.count)
+            first.writeBytes(accepted)
+            upstreamSide.near.pipeline.fireChannelRead(first)
+
+            // Client biến mất đúng như `ConnectTunnelHandler.upstreamVanished`
+            // làm: nửa-đóng CÓ XẢ. Từ đây `client.write` phải trả `false`.
+            GuardedPeer<ByteBuffer>(channel: clientSide.near).closeAfterPendingWrites(
+                stallTimeout: .seconds(30), lingerTimeout: .seconds(30),
+                onDrainAbandoned: { _ in Issue.record("peer đọc hết, không được bỏ cuộc") })
+
+            var second = upstreamSide.near.allocator.buffer(capacity: rejected.count)
+            second.writeBytes(rejected)
+            upstreamSide.near.pipeline.fireChannelRead(second)
+
+            upstreamSide.near.pipeline.fireErrorCaught(
+                IOError(errnoCode: ECONNRESET, reason: "injected"))
+        }.get()
+
+        let failures = try await loop.submit { () -> [String] in
+            recorder.events.compactMap {
+                if case .failed(_, let message, _) = $0 { return message }
+                return nil
+            }
+        }.get()
+        #expect(failures.count == 1)
+        let inflated = accepted.count + rejected.count
+        #expect(failures.first?.contains("\(accepted.count) byte") == true,
+                "phải nêu \(accepted.count) byte đã chuyển được, không phải \(inflated): \(failures.first ?? "-")")
+    }
+
     @Test("Host trong bypass list được relay byte thô hai chiều và ghi transaction .tunnelled")
     func relaysBytesForBypassedHost() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)

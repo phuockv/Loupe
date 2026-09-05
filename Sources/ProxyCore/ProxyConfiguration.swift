@@ -28,8 +28,12 @@ public struct ProxyConfiguration: Sendable {
     }
 
     /// Khớp cả subdomain: "api.apple.com" khớp mục "apple.com".
+    /// Handles trailing dot (FQDN) and case-insensitive matching.
     public func isBypassed(host: String) -> Bool {
-        let lower = host.lowercased()
-        return bypassedHosts.contains { lower == $0 || lower.hasSuffix("." + $0) }
+        var lower = host.lowercased()
+        if lower.hasSuffix(".") {
+            lower.removeLast()
+        }
+        return bypassedHosts.contains { lower == $0.lowercased() || lower.hasSuffix("." + $0.lowercased()) }
     }
 }

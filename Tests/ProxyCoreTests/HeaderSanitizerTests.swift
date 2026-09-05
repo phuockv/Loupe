@@ -74,4 +74,103 @@ struct HeaderSanitizerTests {
         headers.add(name: "Set-Cookie", value: "b=2")
         #expect(HeaderSanitizer.sanitize(headers)["Set-Cookie"].count == 2)
     }
+
+    // Edge cases and correctness tests
+
+    @Test("Connection header value makes field hop-by-hop")
+    func connectionHeaderNamesList() {
+        var headers = HTTPHeaders()
+        headers.add(name: "X-Custom", value: "value")
+        headers.add(name: "Connection", value: "X-Custom")
+        headers.add(name: "Authorization", value: "Bearer abc")
+
+        let clean = HeaderSanitizer.sanitize(headers)
+        #expect(clean.first(name: "X-Custom") == nil)
+        #expect(clean.first(name: "Authorization") == "Bearer abc")
+        #expect(clean.first(name: "Connection") == nil)
+    }
+
+    @Test("Port out of range in parseAbsoluteForm returns nil")
+    func absoluteFormOutOfRangePort() {
+        #expect(HeaderSanitizer.parseAbsoluteForm("http://example.com:99999") == nil)
+        #expect(HeaderSanitizer.parseAbsoluteForm("http://example.com:0") == nil)
+        #expect(HeaderSanitizer.parseAbsoluteForm("http://example.com:65536") == nil)
+    }
+
+    @Test("parseConnectTarget IPv6 with port [::1]:443")
+    func connectIPv6WithPort() {
+        let target = HeaderSanitizer.parseConnectTarget("[::1]:443")
+        #expect(target?.host == "[::1]")
+        #expect(target?.port == 443)
+    }
+
+    @Test("parseConnectTarget bare IPv6 [::1] defaults to 443")
+    func connectIPv6Bare() {
+        let target = HeaderSanitizer.parseConnectTarget("[::1]")
+        #expect(target?.host == "[::1]")
+        #expect(target?.port == 443)
+    }
+
+    @Test("parseConnectTarget malformed IPv6 [::1 returns nil")
+    func connectIPv6Malformed() {
+        #expect(HeaderSanitizer.parseConnectTarget("[::1") == nil)
+    }
+
+    @Test("parseConnectTarget empty string returns nil")
+    func connectEmptyString() {
+        #expect(HeaderSanitizer.parseConnectTarget("") == nil)
+    }
+
+    @Test("parseConnectTarget missing host before colon returns nil")
+    func connectMissingHost() {
+        #expect(HeaderSanitizer.parseConnectTarget(":443") == nil)
+    }
+
+    @Test("parseConnectTarget missing port after colon returns nil")
+    func connectMissingPort() {
+        #expect(HeaderSanitizer.parseConnectTarget("example.com:") == nil)
+    }
+
+    @Test("parseConnectTarget non-numeric port returns nil")
+    func connectNonNumericPort() {
+        #expect(HeaderSanitizer.parseConnectTarget("example.com:notanumber") == nil)
+    }
+
+    @Test("parseConnectTarget out of range port returns nil")
+    func connectOutOfRangePort() {
+        #expect(HeaderSanitizer.parseConnectTarget("example.com:99999") == nil)
+        #expect(HeaderSanitizer.parseConnectTarget("example.com:0") == nil)
+        #expect(HeaderSanitizer.parseConnectTarget("example.com:-443") == nil)
+    }
+
+    @Test("isBypassed matches trailing-dot FQDN")
+    func bypassedTrailingDot() {
+        let config = ProxyConfiguration()
+        #expect(config.isBypassed(host: "apple.com."))
+    }
+
+    @Test("isBypassed does not match unrelated hosts")
+    func bypassedNotmatching() {
+        let config = ProxyConfiguration()
+        #expect(!config.isBypassed(host: "notapple.com"))
+    }
+
+    @Test("isBypassed does not match partial subdomain")
+    func bypassedPartialSubdomain() {
+        let config = ProxyConfiguration()
+        #expect(!config.isBypassed(host: "apple.com.evil.com"))
+    }
+
+    @Test("isBypassed case-insensitive matching")
+    func bypassedCaseInsensitive() {
+        let config = ProxyConfiguration()
+        #expect(config.isBypassed(host: "API.APPLE.COM"))
+    }
+
+    @Test("isBypassed subdomain with custom bypass list")
+    func bypassedSubdomain() {
+        let config = ProxyConfiguration(bypassedHosts: ["example.com"])
+        #expect(config.isBypassed(host: "api.example.com"))
+        #expect(config.isBypassed(host: "api.example.com."))
+    }
 }

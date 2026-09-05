@@ -121,33 +121,83 @@ extension GuardedPeer where Part == ByteBuffer {
     ///   tới client — chúng còn nằm trong send buffer của kernel. `close()` một
     ///   socket đang CÒN dữ liệu chưa đọc ở chiều vào thì BSD/POSIX gửi RST chứ
     ///   không gửi FIN, và RST vứt luôn send buffer. Mà "còn dữ liệu chưa đọc ở
-    ///   chiều vào" chính là ca ta đang xử lý: client vẫn đang gửi. Đo được:
-    ///   promise xả báo `success()` xong client vẫn chỉ nhận 701 KB trên 8 MiB.
+    ///   chiều vào" chính là ca ta đang xử lý: client vẫn đang gửi. Quan sát
+    ///   được: promise xả báo `success()` mà client vẫn thiếu byte, test hồi
+    ///   quy đỏ 12/12 cho tới khi đổi sang nửa-đóng.
     ///   `shutdown(how: .WR)` gửi FIN, không đụng gì tới dữ liệu đang chờ.
     ///
+    /// HAI giai đoạn, HAI hạn chờ khác nhau, vì hỏng ở hai giai đoạn có hậu quả
+    /// khác hẳn nhau:
+    ///
+    /// - **Xả** (`stallTimeout`): hết hạn ở đây LÀM MẤT DỮ LIỆU. Nên nó không
+    ///   phải hạn theo tổng thời gian — tunnel không có backpressure, lượng tồn
+    ///   khi origin đóng về nguyên tắc không có trần, và một client đường truyền
+    ///   chậm ôm hàng chục MB thì không con số cố định nào là đủ. Nó là hạn
+    ///   ĐỨNG IM: mỗi chu kỳ so `bufferedWritableBytes` với lần trước, còn tụt
+    ///   thì cho đi tiếp, đứng nguyên trọn một chu kỳ mới bỏ cuộc. Client chậm
+    ///   mà vẫn tiến thì chờ bao lâu cũng được; client chết cứng thì vẫn có trần.
+    /// - **Nán** (`lingerTimeout`): sau khi FIN của ta đã đi, ta chỉ còn chờ peer
+    ///   đóng nốt chiều của nó. Hết hạn ở đây KHÔNG mất gì — byte của ta đã ra
+    ///   hết socket — nên một hạn cố định là đủ.
+    ///
+    /// Ranh giới giữa hai giai đoạn là promise của `close(mode: .output, promise:)`:
+    /// NIO chỉ hoàn tất nó SAU khi hàng đợi ghi sạch và `shutdown(how: .WR)` đã
+    /// gọi. Truyền `nil` vào đó (bản trước) là vứt đúng tín hiệu phân biệt được
+    /// hai giai đoạn, và đó là lý do bản trước gộp cả hai vào một hạn duy nhất.
+    ///
     /// Channel đóng hẳn lúc peer đóng chiều của nó (EOF → NIO đóng hẳn vì
-    /// `allowRemoteHalfClosure` mặc định là false), hoặc lúc hết `timeout` —
-    /// chặn trên để một peer không bao giờ đóng cũng không giữ channel mãi mãi.
+    /// `allowRemoteHalfClosure` mặc định là false), hoặc lúc hết hạn nán.
     ///
     /// Vẫn ràng buộc `Part == ByteBuffer` dù giờ không còn ghi gì: nửa-đóng
     /// chiều ra là ngữ nghĩa của TUNNEL. Với một channel HTTP thì nó sai — sau
     /// khi FIN đi rồi ta không còn nói được gì với client nữa, kể cả một lỗi.
-    func closeAfterPendingWrites(within timeout: TimeAmount = .seconds(15)) {
+    func closeAfterPendingWrites(stallTimeout: TimeAmount = .seconds(15),
+                                 lingerTimeout: TimeAmount = .seconds(15)) {
         let channel = self.channel
         guard channel.isActive else {
             channel.close(promise: nil)
             return
         }
-        // Hạn chót cho TOÀN BỘ việc dọn dẹp, không riêng phần xả: sau nửa-đóng
-        // ta còn chờ peer đóng nốt chiều của nó. Huỷ khi channel đóng hẳn để
-        // không giữ một task treo lơ lửng cho mỗi lần dọn tunnel.
-        // `Scheduled.cancel()` sau khi task đã chạy là an toàn: NIO ghi rõ cancel
-        // là best-effort, và `_setValue` chỉ nhận giá trị đầu tiên
-        // (`if self._value == nil`), không precondition.
-        let deadline = channel.eventLoop.scheduleTask(in: timeout) {
-            channel.close(promise: nil)
+
+        let progress = DrainProgress()
+        let stallWatchdog = channel.eventLoop.scheduleRepeatedTask(
+            initialDelay: stallTimeout, delay: stallTimeout
+        ) { task in
+            // `syncOptions` hợp lệ ở đây: callback của scheduleRepeatedTask luôn
+            // chạy trên event loop của chính channel này.
+            guard let pending = (try? channel.syncOptions?.getOption(.bufferedWritableBytes)) ?? nil
+            else {
+                task.cancel()
+                return
+            }
+            if pending == 0 || pending < progress.lastPending {
+                progress.lastPending = pending
+            } else {
+                task.cancel()
+                channel.close(promise: nil)
+            }
         }
-        channel.closeFuture.whenComplete { _ in deadline.cancel() }
-        channel.close(mode: .output, promise: nil)
+
+        let outputClosed = channel.eventLoop.makePromise(of: Void.self)
+        outputClosed.futureResult.whenComplete { _ in
+            stallWatchdog.cancel()
+            // Từ đây trở đi hết hạn không mất gì nữa. `Scheduled.cancel()` sau
+            // khi task đã chạy là an toàn: NIO ghi rõ cancel là best-effort, và
+            // `_setValue` chỉ nhận giá trị đầu tiên (`if self._value == nil`).
+            let linger = channel.eventLoop.scheduleTask(in: lingerTimeout) {
+                channel.close(promise: nil)
+            }
+            channel.closeFuture.whenComplete { _ in linger.cancel() }
+        }
+        channel.close(mode: .output, promise: outputClosed)
     }
+}
+
+/// Số byte còn tồn ở lần kiểm trước của watchdog xả.
+///
+/// `@unchecked Sendable` có cơ sở chứ không phải để làm ngơ: nó CHỈ được đụng
+/// bên trong callback của `scheduleRepeatedTask`, mà callback đó luôn chạy trên
+/// đúng một event loop — của channel đang xả.
+private final class DrainProgress: @unchecked Sendable {
+    var lastPending = Int.max
 }

@@ -483,6 +483,112 @@ struct ConnectTunnelTests {
         #expect(received == download, "nội dung tải về không khớp nguyên văn")
     }
 
+    /// Lỗi trên chân upstream: phần đã nhận vẫn phải tới client ĐỦ, và phải có
+    /// một `.failed` ghi lại.
+    ///
+    /// Test này TIÊM lỗi thay vì khiêu khích ra lỗi thật, và đó là điểm mấu
+    /// chốt. Ở vòng trước tôi kết luận đường này "không kiểm tất định được", vì
+    /// muốn có `ECONNRESET` thật thì origin phải đóng hẳn — mà chính cái RST đó
+    /// làm kernel vứt phần dữ liệu proxy chưa kịp đọc, nên test đỏ ngẫu nhiên vì
+    /// lý do nằm dưới code của mình. Kết luận đó SAI ở chỗ nó chỉ đúng cho hình
+    /// dạng end-to-end: `fireErrorCaught` là API công khai, còn
+    /// `TunnelRelayHandler`/`GuardedPeer`/`TunnelReporter` đều dựng thẳng được
+    /// từ test `@testable`. Tiêm lỗi thì không còn cuộc đua nào với kernel.
+    ///
+    /// Không dùng `EmbeddedChannel`: `EmbeddedChannel.close0` bỏ qua `CloseMode`
+    /// và luôn đóng hẳn, nên nó sẽ quan sát nhầm đúng thứ đang cần kiểm.
+    @Test("Lỗi chân upstream: byte đã xếp hàng vẫn tới client đủ, và có .failed ghi lại")
+    func upstreamErrorDeliversQueuedBytesAndRecordsFailure() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await group.shutdownGracefully() } }
+        // Ghim mọi thứ vào MỘT event loop, đúng như production ghim upstream vào
+        // event loop của client channel.
+        let loop = group.next()
+
+        // Chân "client" của proxy: đầu kia (browser) đọc rất chậm.
+        let proxySide = loop.makePromise(of: Channel.self)
+        let clientFacingServer = try await ServerBootstrap(group: loop)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { channel in
+                proxySide.succeed(channel)
+                return channel.eventLoop.makeSucceededVoidFuture()
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        defer { clientFacingServer.close(promise: nil) }
+
+        let collector = RawByteCollector()
+        let browser = try await ClientBootstrap(group: loop)
+            .channelOption(.autoRead, value: false)
+            .channelOption(.socketOption(.so_rcvbuf), value: SocketOptionValue(16 * 1024))
+            .channelInitializer { $0.pipeline.addHandler(collector) }
+            .connect(host: "127.0.0.1", port: clientFacingServer.localAddress!.port!).get()
+        defer { browser.close(promise: nil) }
+        let clientChannel = try await proxySide.futureResult.get()
+
+        // Channel "upstream" thật để mang `TunnelRelayHandler` — nối tới một
+        // server chỉ nhận rồi im.
+        let blackHole = try await ServerBootstrap(group: loop)
+            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
+            .childChannelInitializer { $0.eventLoop.makeSucceededVoidFuture() }
+            .bind(host: "127.0.0.1", port: 0).get()
+        defer { blackHole.close(promise: nil) }
+        let upstream = try await ClientBootstrap(group: loop)
+            .connect(host: "127.0.0.1", port: blackHole.localAddress!.port!).get()
+
+        let recorder = RecordingSink()
+        let transactionID = UUID()
+        try await upstream.eventLoop.submit {
+            let reporter = TunnelReporter(transactionID: transactionID,
+                                          sink: { recorder.record($0) })
+            try upstream.pipeline.syncOperations.addHandler(
+                TunnelRelayHandler(client: GuardedPeer(channel: clientChannel),
+                                   reporter: reporter))
+        }.get()
+
+        // Nhồi cho `pendingWrites` phía client đầy: browser không đọc và chỉ có
+        // 16 KiB buffer nhận, nên gần như trọn 8 MiB nằm lại trong hàng đợi ghi.
+        //
+        // Bơm vào bằng `fireChannelRead` trên chân upstream chứ không ghi thẳng
+        // vào peer: như vậy byte đi qua ĐÚNG đường relay thật
+        // (`TunnelRelayHandler.channelRead`), nên bộ đếm mà báo cáo lỗi trích
+        // dẫn cũng là con số thật chứ không phải số 0 vô nghĩa.
+        let payload = Data((0..<(8 * 1024 * 1024)).map { UInt8(truncatingIfNeeded: $0 &* 17 &+ 3) })
+        try await loop.submit {
+            var buffer = upstream.allocator.buffer(capacity: payload.count)
+            buffer.writeBytes(payload)
+            upstream.pipeline.fireChannelRead(NIOAny(buffer))
+        }.get()
+
+        // TIÊM lỗi vào chân upstream. Tuần tự sau lần ghi ở trên vì cả hai đều
+        // đi qua cùng một event loop và test await từng cái.
+        upstream.pipeline.fireErrorCaught(IOError(errnoCode: ECONNRESET, reason: "injected"))
+
+        // Giờ mới cho browser đọc. Nếu chân client bị đóng cứng, phần lớn 8 MiB
+        // đã bị `cancelWritesOnClose` vứt và chỗ này sẽ hỏng.
+        let downloadFuture = expect(payload.count, from: collector, on: browser,
+                                    timeout: .seconds(30))
+        try await browser.setOption(.autoRead, value: true).get()
+        browser.read()
+
+        let received = try await downloadFuture.get()
+        #expect(received.count == payload.count,
+                "nhận \(received.count)/\(payload.count) byte")
+        #expect(received == payload, "nội dung không khớp nguyên văn")
+
+        // ...và lỗi phải được GHI LẠI: giao đủ byte mà bản ghi hiện một tunnel
+        // sạch sẽ thì công cụ vẫn đang nói dối.
+        let failures = try await loop.submit { () -> [(UUID, String)] in
+            recorder.events.compactMap {
+                if case .failed(let id, let message, _) = $0 { return (id, message) }
+                return nil
+            }
+        }.get()
+        #expect(failures.count == 1, "đúng một .failed cho tunnel này")
+        #expect(failures.first?.0 == transactionID)
+        #expect(failures.first?.1.contains("\(payload.count) byte") == true,
+                "message phải nêu số byte đã chuyển được: \(failures.first?.1 ?? "-")")
+    }
+
     /// Nhánh KHÔNG bypass đi qua đúng cùng một đoạn gỡ pipeline rồi mới rẽ
     /// sang `beginMITM`. Task 8 sẽ thay thân hàm đó, nhưng tới lúc ấy thì mọi
     /// host HTTPS không nằm trong bypass list đều chạy qua đây — nên đường này

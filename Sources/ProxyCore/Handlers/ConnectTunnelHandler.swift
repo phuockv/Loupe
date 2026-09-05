@@ -18,14 +18,15 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     private let port: Int
     private let transactionID: UUID
     private let maxBufferedBytes: Int
-    private let sink: TrafficEventSink
+    private let reporter: TunnelReporter
 
     private var upstream: GuardedPeer<ByteBuffer>?
     /// Channel client mà handler này đang ngồi trên, bọc CÙNG kiểu peer để dùng
     /// được `closeAfterPendingWrites`. Ràng buộc `Part == ByteBuffer` của hàm
-    /// đó là có lý do (một `ByteBuffer` rỗng đi qua pipeline còn encoder HTTP
-    /// là crash), và ràng buộc ấy chỉ còn giá trị nếu mọi channel đều đi qua
-    /// `GuardedPeer` — kể cả channel của chính mình.
+    /// đó là có lý do — nửa-đóng chiều ra là ngữ nghĩa TUNNEL, với channel HTTP
+    /// thì sai (xem `GuardedPeer.closeAfterPendingWrites`) — và ràng buộc ấy chỉ
+    /// còn giá trị nếu mọi channel đều đi qua `GuardedPeer`, kể cả channel của
+    /// chính mình.
     private var client: GuardedPeer<ByteBuffer>?
     /// Byte client gửi trước khi upstream sẵn sàng — gồm cả phần byte mà
     /// decoder HTTP đẩy xuống lúc bị gỡ (`leftOverBytesStrategy: .forwardBytes`),
@@ -43,12 +44,17 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         self.port = port
         self.transactionID = transactionID
         self.maxBufferedBytes = maxBufferedBytes
-        self.sink = sink
+        self.reporter = TunnelReporter(transactionID: transactionID, sink: sink)
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
         let clientChannel = context.channel
         client = GuardedPeer(channel: clientChannel)
+        // `TunnelReporter` cố ý KHÔNG Sendable (cùng lý do như `SessionState`:
+        // hai channel ghim chung một event loop nên không cần khoá), mà
+        // `channelInitializer` đòi closure @Sendable — bọc NIOLoopBoundBox, hợp
+        // lệ vì bootstrap dùng `group: context.eventLoop`.
+        let boundReporter = NIOLoopBoundBox(reporter, eventLoop: context.eventLoop)
         // Ghim upstream vào ĐÚNG event loop của client channel: hai đầu tunnel
         // không bao giờ chạy song song, nên `buffered`/`upstream` không cần khoá.
         let boundSelf = NIOLoopBoundBox(self, eventLoop: context.eventLoop)
@@ -56,7 +62,8 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
             .channelInitializer { channel in
                 do {
                     try channel.pipeline.syncOperations.addHandler(
-                        TunnelRelayHandler(client: GuardedPeer(channel: clientChannel))
+                        TunnelRelayHandler(client: GuardedPeer(channel: clientChannel),
+                                           reporter: boundReporter.value)
                     )
                     return channel.eventLoop.makeSucceededVoidFuture()
                 } catch {
@@ -95,9 +102,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
             guard !isFinished else { return }
             // Tunnel là đường DUY NHẤT ta báo cáo cho transaction này (nó
             // không đi qua `UpstreamHandler`), nên `.failed` phát ở đây.
-            sink(.failed(id: transactionID,
-                         message: "tunnel không nối được \(host):\(port) — \(error)",
-                         endedAt: Date()))
+            reporter.reportFailure("tunnel không nối được \(host):\(port) — \(error)")
             abandon()
         }
     }
@@ -108,9 +113,8 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
 
         guard let upstream else {
             guard bufferedBytes + buffer.readableBytes <= maxBufferedBytes else {
-                sink(.failed(id: transactionID,
-                             message: "client gửi quá \(maxBufferedBytes) byte trước khi tunnel tới \(host):\(port) sẵn sàng",
-                             endedAt: Date()))
+                reporter.reportFailure(
+                    "client gửi quá \(maxBufferedBytes) byte trước khi tunnel tới \(host):\(port) sẵn sàng")
                 abandon()
                 return
             }
@@ -150,9 +154,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     /// còn phía client (chân đang lỗi) đóng thẳng.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         guard !isFinished else { return }
-        sink(.failed(id: transactionID,
-                     message: "lỗi trên tunnel tới \(host):\(port) — \(error)",
-                     endedAt: Date()))
+        reporter.reportFailure("lỗi ở chân client của tunnel tới \(host):\(port) — \(error)")
         isFinished = true
         buffered = []
         bufferedBytes = 0
@@ -212,13 +214,19 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
     private let client: GuardedPeer<ByteBuffer>
+    private let reporter: TunnelReporter
     /// Channel upstream mà handler này đang ngồi trên — cùng lý do như
     /// `ConnectTunnelHandler.client`: `closeAfterPendingWrites` chỉ tồn tại
     /// trên `GuardedPeer<ByteBuffer>`, và đó là ràng buộc muốn giữ.
     private var upstream: GuardedPeer<ByteBuffer>?
+    /// Chỉ để BÁO CÁO. Đây là con số duy nhất ta biết chắc về một tunnel mù, và
+    /// nó là thứ hữu ích nhất còn lại khi phải nói "có lỗi nhưng không rõ nội
+    /// dung đã xong hay chưa".
+    private var bytesRelayedToClient = 0
 
-    init(client: GuardedPeer<ByteBuffer>) {
+    init(client: GuardedPeer<ByteBuffer>, reporter: TunnelReporter) {
         self.client = client
+        self.reporter = reporter
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -226,6 +234,7 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        bytesRelayedToClient += unwrapInboundIn(data).readableBytes
         if !client.write(unwrapInboundIn(data), flush: true) {
             // Client đã biến mất. Đóng phía upstream có drain, không đóng
             // thẳng: nó có thể đang giữ byte client đã gửi mà origin chưa đọc
@@ -260,8 +269,61 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     /// Lỗi ở chân upstream không nói gì về tính toàn vẹn của những byte ta ĐÃ
     /// nhận từ upstream và đã xếp hàng cho client. Chân đang lỗi thì đóng
     /// thẳng; chân còn lại vẫn được trả nốt thứ nó được nợ.
+    ///
+    /// Nói cho chặt: ở đây ta thậm chí KHÔNG có lựa chọn nào về chân đang lỗi.
+    /// `BaseSocketChannel.readable0` gọi `fireErrorCaught(err)` rồi ngay sau đó
+    /// `if shouldCloseOnReadError(err) { close0(mode: .all) }`, mà
+    /// `SocketChannel.shouldCloseOnReadError` chỉ trả `false` cho đúng một loại
+    /// (`NIOFcntlFailedError`) — nên chân lỗi bị NIO đóng hẳn dù handler có xin
+    /// hay không. Quyết định DUY NHẤT `errorCaught` thực sự đưa ra là làm gì với
+    /// peer CÒN SỐNG, và ở đó đóng cứng phá tới trọn một response đã xếp hàng mà
+    /// không mua lại được tín hiệu nào.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        // Ghi nhận, chứ KHÔNG quay lại đóng cứng. Không ghi nhận thì client nhận
+        // một FIN đàng hoàng CÒN bản ghi hiện một tunnel sạch sẽ — tức công cụ
+        // nói dối, đúng thứ cả file này sinh ra để chặn.
+        //
+        // Message nêu đúng thứ ta BIẾT và nói rõ thứ ta KHÔNG biết: tunnel mù
+        // không nhìn được vào trong dòng TLS, nên handler này không có cách nào
+        // phân biệt "reset vô hại sau khi origin đã gửi xong" với "origin chết
+        // giữa chừng". Đoán bừa trong text sự kiện còn tệ hơn im lặng; nêu số
+        // byte đã chuyển được là dữ kiện thật và dùng được.
+        reporter.reportFailure(
+            "upstream lỗi giữa tunnel — \(error); đã chuyển \(bytesRelayedToClient) byte "
+            + "về client và số byte đó vẫn được giao nốt. Tunnel mù không đọc được nội dung "
+            + "nên không phân biệt được origin đã gửi xong hay bị cắt giữa chừng."
+        )
         client.closeAfterPendingWrites()
         context.close(promise: nil)
+    }
+}
+
+/// Phát `.failed` cho một transaction tunnel, ĐÚNG MỘT LẦN, dùng chung giữa hai
+/// đầu.
+///
+/// Cần dùng chung vì hai handler ở hai channel khác nhau đều có thể là nơi đầu
+/// tiên phát hiện tunnel hỏng (`ConnectTunnelHandler` ở chân client,
+/// `TunnelRelayHandler` ở chân upstream), và một lỗi thường làm CẢ HAI chân
+/// hỏng theo. Không có chốt chung thì cùng một sự cố sinh hai `.failed` cho
+/// cùng một id.
+///
+/// Không khoá, không actor: hai channel được ghim vào CÙNG event loop (xem
+/// `ConnectTunnelHandler.handlerAdded` dùng `ClientBootstrap(group:)` với event
+/// loop của client channel), nên chúng không bao giờ chạy song song — cùng lập
+/// luận với `SessionState`.
+final class TunnelReporter {
+    private let transactionID: UUID
+    private let sink: TrafficEventSink
+    private var hasReported = false
+
+    init(transactionID: UUID, sink: @escaping TrafficEventSink) {
+        self.transactionID = transactionID
+        self.sink = sink
+    }
+
+    func reportFailure(_ message: String) {
+        guard !hasReported else { return }
+        hasReported = true
+        sink(.failed(id: transactionID, message: message, endedAt: Date()))
     }
 }

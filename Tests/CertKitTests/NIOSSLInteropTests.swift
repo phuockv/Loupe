@@ -6,6 +6,7 @@ import X509
 import NIOSSL
 import NIOCore
 import NIOPosix
+import NIOTLS
 
 /// Chứng minh rủi ro 11.1 của spec: NIOSSL có nạp được vật liệu
 /// do swift-certificates + swift-crypto sinh ra hay không.
@@ -97,11 +98,14 @@ extension NIOSSLInteropTests {
                 .get()
 
             let port = server.localAddress!.port!
+            let handshakeCompletedPromise = group.next().makePromise(of: String?.self)
             let client = try await ClientBootstrap(group: group)
                 .channelInitializer { channel in
                     do {
                         let tls = try NIOSSLClientHandler(context: clientContext, serverHostname: nil)
-                        return channel.pipeline.addHandler(tls)
+                        return channel.pipeline.addHandler(tls).flatMap {
+                            channel.pipeline.addHandler(HandshakeCompletionHandler(promise: handshakeCompletedPromise))
+                        }
                     } catch {
                         return channel.eventLoop.makeFailedFuture(error)
                     }
@@ -109,8 +113,14 @@ extension NIOSSLInteropTests {
                 .connect(host: "127.0.0.1", port: port)
                 .get()
 
-            // Kết nối lên được nghĩa là handshake đã xong.
-            #expect(client.isActive)
+            // `connect().get()` chỉ chờ TCP `channelActive`, TRƯỚC khi
+            // ClientHello/ServerHello/Finished chạy xong — `client.isActive` không
+            // chứng minh handshake TLS đã hoàn tất. `TLSUserEvent.handshakeCompleted`
+            // do chính NIOSSLHandler bắn ra sau khi handshake thật sự xong mới là
+            // bằng chứng đúng, và giá trị ALPN đi kèm còn xác nhận luôn cấu hình
+            // "http/1.1" có hiệu lực.
+            let negotiatedProtocol = try await handshakeCompletedPromise.futureResult.get()
+            #expect(negotiatedProtocol == "http/1.1")
             try await client.close()
             try await server.close()
             try await group.shutdownGracefully()
@@ -118,5 +128,25 @@ extension NIOSSLInteropTests {
             try? await group.shutdownGracefully()
             throw error
         }
+    }
+}
+
+/// Bắt sự kiện `TLSUserEvent.handshakeCompleted` mà `NIOSSLHandler` bắn ra sau
+/// khi handshake TLS thật sự hoàn tất, để test có bằng chứng đúng thay vì suy
+/// diễn từ trạng thái TCP.
+private final class HandshakeCompletionHandler: ChannelInboundHandler, Sendable {
+    typealias InboundIn = Any
+
+    private let promise: EventLoopPromise<String?>
+
+    init(promise: EventLoopPromise<String?>) {
+        self.promise = promise
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if case .handshakeCompleted(let negotiatedProtocol) = event as? TLSUserEvent {
+            promise.succeed(negotiatedProtocol)
+        }
+        context.fireUserInboundEventTriggered(event)
     }
 }

@@ -50,6 +50,9 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
     func handlerAdded(context: ChannelHandlerContext) {
         let clientChannel = context.channel
         client = GuardedPeer(channel: clientChannel)
+        // Chân client. Chân upstream được đăng ký ở `upstreamConnected` khi (và
+        // chỉ khi) nó thật sự được nhận nuôi — xem `TunnelReporter.legClosed`.
+        reporter.legOpened()
         // `TunnelReporter` cố ý KHÔNG Sendable (cùng lý do như `SessionState`:
         // hai channel ghim chung một event loop nên không cần khoá), mà
         // `channelInitializer` đòi closure @Sendable — bọc NIOLoopBoundBox, hợp
@@ -88,6 +91,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
                 return
             }
             upstream = peer
+            reporter.legOpened()
             let replay = buffered
             buffered = []
             bufferedBytes = 0
@@ -142,6 +146,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         upstream = nil
         buffered = []
         bufferedBytes = 0
+        reporter.legClosed()
         context.fireChannelInactive()
     }
 
@@ -289,6 +294,7 @@ final class TunnelRelayHandler: ChannelInboundHandler {
             isFinished = true
             drainClient()
         }
+        reporter.legClosed()
         context.fireChannelInactive()
     }
 
@@ -385,6 +391,8 @@ final class TunnelReporter {
     private let transactionID: UUID
     private let sink: TrafficEventSink
     private var hasReported = false
+    /// Số chân tunnel đã dựng mà chưa đóng hẳn. Xem `legClosed`.
+    private var openLegs = 0
 
     init(transactionID: UUID, sink: @escaping TrafficEventSink) {
         self.transactionID = transactionID
@@ -395,5 +403,32 @@ final class TunnelReporter {
         guard !hasReported else { return }
         hasReported = true
         sink(.failed(id: transactionID, message: message, endedAt: Date()))
+    }
+
+    /// Một chân tunnel vừa được dựng. Phải gọi TRƯỚC khi chân đó có thể đóng.
+    func legOpened() {
+        openLegs += 1
+    }
+
+    /// Một chân tunnel vừa đóng hẳn. Chân CUỐI CÙNG đóng là lúc tunnel kết
+    /// thúc; nếu tới lúc đó chưa ai báo gì thì nó đã kết thúc SẠCH.
+    ///
+    /// Vì sao phải là chân CUỐI chứ không phải chân đầu — chỗ này dễ sai:
+    /// `ConnectTunnelHandler.channelInactive` chạy khi client đóng, rồi nó gọi
+    /// `closeAfterPendingWrites` lên upstream, và lượt xả đó có thể BỎ CUỘC vài
+    /// giây sau rồi gọi `reportFailure`. Báo "kết thúc sạch" ngay ở chân đầu sẽ
+    /// khoá chốt at-most-once và NUỐT MẤT báo cáo cắt cụt đó — đúng lớp bug
+    /// "công cụ nói dối" mà `TunnelReporter` sinh ra để chặn. Đợi tới chân cuối
+    /// thì mọi lượt xả hoặc đã xong, hoặc đã kịp báo.
+    func legClosed() {
+        openLegs -= 1
+        guard openLegs <= 0, !hasReported else { return }
+        hasReported = true
+        // Response THẬT mà proxy đã gửi cho CONNECT này, không phải một giá trị
+        // tổng hợp cho đẹp bảng. Thiếu event này thì MỌI kết nối HTTPS để lại
+        // một dòng treo vĩnh viễn trong UI — công cụ hiển thị một trạng thái
+        // không đúng sự thật.
+        sink(.completed(id: transactionID, ConnectEstablished.responseModel,
+                        endedAt: Date()))
     }
 }

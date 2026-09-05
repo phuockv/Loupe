@@ -173,4 +173,33 @@ struct HeaderSanitizerTests {
         #expect(config.isBypassed(host: "api.example.com"))
         #expect(config.isBypassed(host: "api.example.com."))
     }
+
+    /// `isIPLiteral` bảo vệ đúng một thứ: `ClientBootstrap.connect(host:)`, tức
+    /// `getaddrinfo`. Nên nó phải nhận ĐÚNG những dạng `getaddrinfo` coi là địa
+    /// chỉ số — kể cả các dạng lịch sử mà `inet_pton` từ chối. Lọt một dạng
+    /// nghĩa là mint một leaf `dNSName` cho một chuỗi không client nào chấp
+    /// nhận, rồi người dùng nhận một lỗi TLS khó đoán.
+    @Test("isIPLiteral nhận cả dạng IPv4 lịch sử mà getaddrinfo chấp nhận")
+    func detectsHistoricalIPv4Forms() {
+        for host in ["127.0.0.1", "192.0.2.1", "0x7f000001", "127.1", "2130706433", "0177.0.0.1"] {
+            #expect(HeaderSanitizer.isIPLiteral(host), "phải coi \(host) là IP")
+        }
+    }
+
+    @Test("isIPLiteral nhận IPv6, cả dạng còn ngoặc của parseConnectTarget")
+    func detectsIPv6IncludingBracketedForm() {
+        #expect(HeaderSanitizer.isIPLiteral("::1"))
+        #expect(HeaderSanitizer.isIPLiteral("2001:db8::1"))
+        #expect(HeaderSanitizer.isIPLiteral("[2001:db8::1]"))
+    }
+
+    /// Vế còn lại, và là vế `inet_aton` dễ làm hỏng: một tên miền thật KHÔNG
+    /// được coi là IP, nếu không thì MitM chết cho mọi host.
+    @Test("isIPLiteral không nhận tên miền")
+    func doesNotTreatHostnamesAsIP() {
+        for host in ["localhost", "example.com", "api.example.com", "1.example.com",
+                     "127.0.0.1.example.com", ""] {
+            #expect(!HeaderSanitizer.isIPLiteral(host), "\(host) không phải IP")
+        }
+    }
 }

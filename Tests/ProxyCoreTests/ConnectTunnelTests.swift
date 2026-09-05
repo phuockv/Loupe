@@ -1,7 +1,9 @@
 import Testing
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOPosix
+import NIOSSL
 import CertKit
 import TrafficModel
 @testable import ProxyCore
@@ -888,8 +890,8 @@ struct ConnectTunnelTests {
     /// và khẳng định stub `beginMITM` đóng kết nối. Stub đó không còn, nên
     /// khẳng định cũ đã hết nghĩa; thứ được giữ lại là bất biến thật sự của
     /// nhánh này: client luôn nhận một câu trả lời dứt khoát và proxy không sập.
-    @Test("Host ngoài bypass list: nhận 200, rồi client không nói TLS thì có .failed gợi ý pinning")
-    func nonBypassedHostFailsHandshakeWithPinningHint() async throws {
+    @Test("Host ngoài bypass list: nhận 200, rồi client không nói TLS thì có .failed nêu bắt tay hỏng")
+    func nonBypassedHostFailsHandshakeAndReportsIt() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         defer { Task { try? await group.shutdownGracefully() } }
 
@@ -950,7 +952,164 @@ struct ConnectTunnelTests {
             return nil
         }
         #expect(failures.map(\.0) == [transaction.id])
-        #expect(failures.first?.1.contains("pinning") == true,
-                "cần gợi ý bypass list, không phải chuỗi TLS thô: \(failures.first?.1 ?? "-")")
+        // Khẳng định HIỆN TƯỢNG + lối đi tiếp, KHÔNG khẳng định "pinning": bài
+        // này gửi một request HTTP thô, tức client ở đây không hề có certificate
+        // để mà từ chối. Chốt một chẩn đoán sai vào test là chứng nhận cho nó.
+        let message = try #require(failures.first?.1)
+        #expect(message.contains("bắt tay TLS với client hỏng"), "nhận: \(message)")
+        #expect(message.contains("bypass list"), "nhận: \(message)")
+    }
+
+    /// Ảnh gương của bài cùng tên bên `MITMProxyTests`, cho nhánh tunnel mù.
+    /// Cùng một lỗ hổng, cùng một cơ chế vá: `.tunnelled` được mở ở
+    /// `establishTunnel` và trước Task 8 fix round 1 thì mọi đường phát event
+    /// kết thúc cho nó đều là đường LỖI — một tunnel chạy tốt rồi đóng sạch
+    /// không phát gì cả, và dòng đó kẹt vĩnh viễn.
+    ///
+    /// Bài này cũng ghim luôn chỗ dễ sai của bản vá: `.completed` chỉ được phát
+    /// khi chân CUỐI đóng. Phát ở chân đầu thì chốt at-most-once của
+    /// `TunnelReporter` sẽ nuốt mất báo cáo của một lượt xả bỏ cuộc sau đó.
+    @Test("Tunnel mù đóng sạch: transaction CONNECT được đánh .completed")
+    func recordsTerminalEventWhenTunnelClosesCleanly() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let origin = try await startByteEchoServer(group: group)
+        defer { origin.close(promise: nil) }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = ["127.0.0.1"]
+
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let events = Task { () -> [TrafficEvent] in
+            var collected: [TrafficEvent] = []
+            for await event in server.events {
+                collected.append(event)
+                if case .completed = event { return collected }
+                if case .failed = event { return collected }
+            }
+            return collected
+        }
+
+        let (client, collector) = try await connectRawClient(group: group, proxyPort: proxyPort)
+        let expectedResponse = Self.expectedConnectResponse
+        let responseFuture = expect(expectedResponse.utf8.count, from: collector, on: client)
+        try await write(Data("""
+        CONNECT 127.0.0.1:\(originPort) HTTP/1.1\r
+        Host: 127.0.0.1:\(originPort)\r
+        \r
+
+        """.utf8), to: client)
+        _ = try await responseFuture.get()
+
+        // Một vòng relay thật để tunnel chắc chắn đã chạy, rồi client đóng sạch.
+        let payload = Data("xin chao".utf8)
+        let echo = expect(payload.count, from: collector, on: client)
+        try await write(payload, to: client)
+        #expect(try await echo.get() == payload)
+        try await client.close()
+
+        let collected = try #require(await awaitWithTimeout(events, seconds: 10))
+        let started = collected.compactMap { event -> Transaction? in
+            if case .started(let transaction) = event { return transaction }
+            return nil
+        }
+        let transaction = try #require(started.first)
+        if case .tunnelled = transaction.state {} else {
+            Issue.record("host trong bypass list phải mở ở .tunnelled")
+        }
+        guard case .completed(let id, let response, _)? = collected.last else {
+            Issue.record("tunnel đóng sạch phải phát .completed, nhận: \(collected)")
+            return
+        }
+        #expect(id == transaction.id)
+        #expect(response.statusCode == 200)
+        #expect(response.reasonPhrase == "Connection Established")
+    }
+
+    /// `closeAfterPendingWrites` chặn channel TLS bằng một `precondition`, mà
+    /// `precondition` thì không test được (nó làm sập tiến trình). Thứ TEST
+    /// ĐƯỢC — và cũng là thứ dễ sai — là phép so kiểu bên trong nó:
+    /// `NIOSSLServerHandler` là LỚP CON của `NIOSSLHandler`, nên phép kiểm chỉ
+    /// hoạt động nếu `handler(type:)` so bằng dynamic cast. Nếu nó so kiểu chính
+    /// xác thì `precondition` sẽ luôn đúng, hazard mở toang, và không có gì đỏ.
+    ///
+    /// `EmbeddedChannel` hợp lệ ở đây: bài này chỉ soi PIPELINE, không đụng tới
+    /// `CloseMode` (thứ mà `EmbeddedChannel.close0` bỏ qua).
+    @Test("Phép kiểm tầng TLS bắt được cả hai lớp con của NIOSSLHandler")
+    func detectsTLSLayerIncludingSubclasses() async throws {
+        let plain = EmbeddedChannel()
+        defer { _ = try? plain.finish() }
+        #expect(!channelHasTLSLayer(plain))
+
+        // Chân upstream của MitM: `NIOSSLClientHandler`. Cấu hình mặc định —
+        // KHÔNG đụng tới `certificateVerification`, kể cả trong test.
+        let clientSide = EmbeddedChannel()
+        defer { _ = try? clientSide.finish() }
+        let clientContext = try NIOSSLContext(
+            configuration: .makeClientConfiguration())
+        try clientSide.pipeline.syncOperations.addHandler(
+            NIOSSLClientHandler(context: clientContext, serverHostname: "example.com"))
+        #expect(channelHasTLSLayer(clientSide))
+
+        // Chân client của MitM: `NIOSSLServerHandler`. Đây mới là lớp con mà
+        // hazard 1 thật sự nói tới.
+        let identity = try await makeLeafCache().identity(forHost: "localhost")
+        let serverContext = try NIOSSLContext(configuration: .makeServerConfiguration(
+            certificateChain: identity.certificateChain.map { .certificate($0) },
+            privateKey: .privateKey(identity.privateKey)))
+        let serverSide = EmbeddedChannel()
+        defer { _ = try? serverSide.finish() }
+        try serverSide.pipeline.syncOperations.addHandler(
+            NIOSSLServerHandler(context: serverContext))
+        #expect(channelHasTLSLayer(serverSide))
+    }
+
+    /// Ghim ĐÚNG quy tắc thứ tự của `TunnelReporter`, thứ mà không bài
+    /// end-to-end nào chạm tới được một cách tất định (muốn tới đó phải để một
+    /// lượt xả đứng im hết hạn 15 s thật).
+    ///
+    /// Quy tắc: "kết thúc sạch" chỉ được phát khi chân CUỐI đóng. Phát ở chân
+    /// đầu thì chốt at-most-once nuốt mất một `.failed` do watchdog xả phát ra
+    /// SAU đó — tức tunnel bị cắt cụt mà bảng vẫn hiện `.completed` sạch sẽ.
+    @Test("TunnelReporter: chân đầu đóng chưa kết thúc, và một lỗi tới sau vẫn được báo")
+    func tunnelReporterWaitsForTheLastLegAndPrefersFailure() {
+        let id = UUID()
+        let events = RecordingSink()
+        let reporter = TunnelReporter(transactionID: id, sink: { events.record($0) })
+
+        reporter.legOpened()          // client
+        reporter.legOpened()          // upstream
+        reporter.legClosed()          // client đóng trước
+        #expect(events.events.isEmpty, "chân đầu đóng chưa phải là kết thúc")
+
+        reporter.reportFailure("lượt xả bị cắt")
+        reporter.legClosed()          // upstream đóng sau
+        #expect(events.failedCount == 1)
+        #expect(events.completedCount == 0, "một lỗi có thật không được thay bằng .completed")
+    }
+
+    @Test("TunnelReporter: cả hai chân đóng mà chưa ai báo gì thì tunnel kết thúc sạch")
+    func tunnelReporterReportsCleanEndOnce() {
+        let id = UUID()
+        let events = RecordingSink()
+        let reporter = TunnelReporter(transactionID: id, sink: { events.record($0) })
+
+        reporter.legOpened()
+        reporter.legOpened()
+        reporter.legClosed()
+        reporter.legClosed()
+        #expect(events.completedCount == 1)
+
+        // Một lỗi tới SAU khi đã kết thúc sạch không được sinh event thứ hai cho
+        // cùng một transaction.
+        reporter.reportFailure("tới muộn")
+        #expect(events.failedCount == 0)
+        #expect(events.completedCount == 1)
     }
 }

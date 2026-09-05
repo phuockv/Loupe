@@ -194,7 +194,13 @@ struct ProxyErrorHandlingTests {
         // `?? nil` làm phẳng `String??`: lớp ngoài là "hết giờ", lớp trong là
         // "stream kết thúc mà không có .failed nào". Cả hai đều là thất bại.
         let message = try #require((await awaitEventsWithTimeout(collected, seconds: 10)) ?? nil)
-        #expect(message.lowercased().contains("pinning"),
-                "người dùng cần gợi ý bypass list, không phải một chuỗi lỗi TLS thô: \(message)")
+        // Ở ĐÂY chẩn đoán pinning là đúng: curl là client TLS thật, nó bắt tay
+        // đàng hoàng rồi bắn alert vì không tin CA — chính hành vi của một app
+        // pin cert. Hai bài "client không nói TLS" cố ý KHÔNG khẳng định điều
+        // này, vì ở đó nó sai.
+        #expect(message.lowercased().contains("cert pinning"),
+                "người dùng cần nguyên nhân khả dĩ, không phải một chuỗi lỗi TLS thô: \(message)")
+        #expect(message.contains("bypass list"),
+                "người dùng cần lối đi tiếp: \(message)")
     }
 }

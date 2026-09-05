@@ -61,16 +61,29 @@ public enum HeaderSanitizer {
     /// cert không client nào chấp nhận, và triệu chứng là một lỗi TLS khó đoán
     /// thay vì một câu người dùng đọc được.
     ///
-    /// Cắt `[]` TRƯỚC `inet_pton` là bắt buộc chứ không phải cho gọn:
+    /// Cắt `[]` TRƯỚC khi phân tích là bắt buộc chứ không phải cho gọn:
     /// `parseConnectTarget` trả host IPv6 ở dạng CÒN NGOẶC (`[2001:db8::1]`),
-    /// mà `inet_pton` không nhận ngoặc — thiếu bước cắt thì mọi CONNECT tới
+    /// mà không hàm parse nào nhận ngoặc — thiếu bước cắt thì mọi CONNECT tới
     /// IPv6 trần lọt lưới và đi thẳng vào MitM với một leaf vô dụng.
+    ///
+    /// IPv4 dùng `inet_aton`, KHÔNG dùng `inet_pton(AF_INET, …)`, và đây là chỗ
+    /// dễ sai: phép kiểm này phải phủ đúng những gì `getaddrinfo` — tức
+    /// `ClientBootstrap.connect(host:)`, thứ nó đứng ra bảo vệ — coi là địa chỉ
+    /// SỐ. `inet_pton` chỉ nhận dotted-quad đủ bốn phần, còn `getaddrinfo` nhận
+    /// cả các dạng lịch sử `0x7f000001`, `127.1`, `2130706433`. Với `inet_pton`
+    /// thì cả ba lọt lưới, mint ra một leaf `dNSName` cho một chuỗi không client
+    /// nào chấp nhận, và người dùng nhận đúng cái lỗi TLS khó đoán mà phép kiểm
+    /// này sinh ra để tránh. `inet_aton` cài đúng bộ dạng lịch sử đó.
+    ///
+    /// Hệ quả cố ý: một host toàn chữ số như `12` bị coi là IP. RFC 1123 không
+    /// cho nhãn cuối của một tên miền toàn số, nên nó không phải tên miền hợp
+    /// lệ, và `getaddrinfo` cũng sẽ đọc nó như một địa chỉ số.
     public static func isIPLiteral(_ host: String) -> Bool {
         let trimmed = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         var v4 = in_addr()
         var v6 = in6_addr()
         return trimmed.withCString {
-            inet_pton(AF_INET, $0, &v4) == 1 || inet_pton(AF_INET6, $0, &v6) == 1
+            inet_aton($0, &v4) == 1 || inet_pton(AF_INET6, $0, &v6) == 1
         }
     }
 

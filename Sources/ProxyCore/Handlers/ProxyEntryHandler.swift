@@ -4,6 +4,32 @@ import NIOHTTP1
 import CertKit
 import TrafficModel
 
+/// Response CONNECT mà proxy THẬT SỰ gửi cho client, giữ ở một chỗ duy nhất.
+///
+/// Tồn tại vì transaction CONNECT được đánh `.completed` bằng CHÍNH response
+/// này khi kết nối đóng sạch — cả nhánh tunnel mù (`TunnelReporter`) lẫn nhánh
+/// MitM (`MITMSessionReporter`). Nếu model ghi lại và `HTTPResponseHead` ghi ra
+/// socket được viết ở hai chỗ thì chúng sẽ lệch, và lúc đó proxy ghi lại một
+/// thứ nó không gửi — đúng lớp lỗi cả module này tồn tại để chặn.
+///
+/// Đây KHÔNG phải một response tổng hợp cho đẹp bảng: proxy đã gửi đúng những
+/// byte này, và `endedAt` là lúc kết nối thật sự đóng.
+enum ConnectEstablished {
+    static let statusCode = 200
+    static let reasonPhrase = "Connection Established"
+    /// Xem khối "ĐỪNG XOÁ DÒNG NÀY CHO ĐÚNG RFC" trong `establishTunnel`.
+    static let contentLengthValue = "0"
+
+    static var status: HTTPResponseStatus {
+        .custom(code: UInt(statusCode), reasonPhrase: reasonPhrase)
+    }
+
+    static var responseModel: ResponseModel {
+        ResponseModel(statusCode: statusCode, reasonPhrase: reasonPhrase,
+                      headers: [(name: "Content-Length", value: contentLengthValue)])
+    }
+}
+
 /// Nằm trước `HTTPProxyHandler`. Chỉ chặn CONNECT; mọi thứ khác cho đi tiếp.
 final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = HTTPServerRequestPart
@@ -103,10 +129,10 @@ final class ProxyEntryHandler: ChannelInboundHandler, RemovableChannelHandler {
         // Cách sửa đúng là ghép cặp encoder/decoder khi dựng pipeline; tới lúc
         // đó thì mới bỏ được dòng này.
         var headers = HTTPHeaders()
-        headers.add(name: "Content-Length", value: "0")
+        headers.add(name: "Content-Length", value: ConnectEstablished.contentLengthValue)
         context.write(wrapOutboundOut(.head(HTTPResponseHead(
             version: .http1_1,
-            status: .custom(code: 200, reasonPhrase: "Connection Established"),
+            status: ConnectEstablished.status,
             headers: headers
         ))), promise: nil)
 

@@ -157,8 +157,8 @@ struct MITMProxyTests {
     /// Với curl thì đường này KHÔNG chạy (curl chờ "200 Connection Established"
     /// rồi mới gửi ClientHello), nên nó cần một bài riêng dựng socket thô.
     /// Payload không phải TLS thật: thứ cần chứng minh là byte ĐẾN ĐƯỢC
-    /// BoringSSL, và một `.failed` gợi ý pinning chỉ phát ra được từ
-    /// `ClientTLSErrorHandler` — tức là chúng đã tới nơi.
+    /// BoringSSL, và một `.failed` nêu bắt tay hỏng chỉ phát ra được từ
+    /// `MITMSessionReporter` — tức là chúng đã tới nơi.
     @Test("Byte đi chung gói với CONNECT vẫn tới được tầng TLS của MitM")
     func bytesArrivingWithConnectReachTheTLSLayer() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
@@ -207,7 +207,10 @@ struct MITMProxyTests {
                 "nhận: \(received)")
 
         let message = try #require((await awaitEventsWithTimeout(failure, seconds: 10)) ?? nil)
-        #expect(message.contains("pinning"),
+        // Không khẳng định "pinning": payload ở đây là HTTP thô, client không
+        // có certificate nào để từ chối. Thứ cần chứng minh là byte tới được
+        // BoringSSL, và "bắt tay TLS hỏng" là dấu vết duy nhất của việc đó.
+        #expect(message.contains("bắt tay TLS với client hỏng"),
                 "byte đi chung gói phải tới được BoringSSL, nhận: \(message)")
     }
 
@@ -293,5 +296,81 @@ struct MITMProxyTests {
             return nil
         }
         #expect(completedIDs == gets.map(\.id))
+    }
+
+    /// Không có bài này thì MỌI kết nối HTTPS để lại một dòng `.pending` treo
+    /// vĩnh viễn: transaction CONNECT được mở ở `establishTunnel`, còn mọi chỗ
+    /// phát event kết thúc cho nó trên nhánh MitM đều là đường LỖI. Các GET bên
+    /// trong hoàn tất đẹp chỉ làm nó tệ hơn — người dùng thấy N dòng sạch cộng
+    /// đúng một dòng kẹt cho mỗi kết nối.
+    ///
+    /// Response được ghi lại là response proxy THẬT SỰ đã gửi
+    /// (`200 Connection Established`), không phải một giá trị tổng hợp.
+    @Test("Kết nối MitM đóng sạch: transaction CONNECT được đánh .completed")
+    func recordsTerminalEventWhenMITMConnectionClosesCleanly() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 3)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MITMTerminal-\(UUID().uuidString)")
+        let authority = try CertificateAuthority.loadOrCreate(in: dir)
+        let cache = try LeafCertificateCache(authority: authority)
+
+        let origin = try await startTLSOriginServer(
+            group: group, authority: authority, host: "localhost"
+        )
+        defer { try? origin.close().wait() }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = []
+        config.additionalTrustRoots = [
+            try NIOSSLCertificate(bytes: authority.certificateDER(), format: .der)
+        ]
+        let server = ProxyServer(configuration: config, leafCache: cache)
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        // Thu tới khi CHÍNH transaction CONNECT có event kết thúc — không dừng ở
+        // `.completed` đầu tiên, vì cái đó là của GET bên trong.
+        let collected = Task { () -> (connect: Transaction?, terminal: TrafficEvent?) in
+            var connect: Transaction?
+            for await event in server.events {
+                switch event {
+                case .started(let transaction) where transaction.request.method == "CONNECT":
+                    connect = transaction
+                case .completed(let id, _, _) where id == connect?.id:
+                    return (connect, event)
+                case .failed(let id, _, _) where id == connect?.id:
+                    return (connect, event)
+                default:
+                    break
+                }
+            }
+            return (connect, nil)
+        }
+
+        let curl = try runCurl([
+            "-sS", "--cacert", dir.appendingPathComponent("ca.pem").path,
+            "-x", "http://127.0.0.1:\(proxyPort)",
+            "https://localhost:\(originPort)/one",
+        ])
+        #expect(curl.status == 0)
+
+        guard let outcome = await awaitEventsWithTimeout(collected, seconds: 15) else {
+            Issue.record("hết giờ chờ event kết thúc cho transaction CONNECT"); return
+        }
+        let connect = try #require(outcome.connect)
+        if case .pending = connect.state {} else {
+            Issue.record("CONNECT ngoài bypass list phải mở ở .pending")
+        }
+        guard case .completed(let id, let response, _)? = outcome.terminal else {
+            Issue.record("CONNECT phải kết thúc bằng .completed, nhận: \(String(describing: outcome.terminal))")
+            return
+        }
+        #expect(id == connect.id)
+        #expect(response.statusCode == 200)
+        #expect(response.reasonPhrase == "Connection Established")
     }
 }

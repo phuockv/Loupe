@@ -13,7 +13,7 @@ import TrafficModel
 /// hợp đồng, không phải tuỳ chọn:
 ///
 /// ```
-/// head → OutputLiveness? → NIOSSLServerHandler → ClientTLSErrorHandler
+/// head → OutputLiveness? → NIOSSLServerHandler → MITMSessionReporter
 ///      → HTTPResponseEncoder → HTTPRequestDecoder → HTTPProxyHandler → tail
 /// ```
 ///
@@ -116,11 +116,11 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
             let sslContext = try NIOSSLContext(configuration: tls)
 
             let sync = channel.pipeline.syncOperations
-            // Lắp NGƯỜI BÁO LỖI TRƯỚC, rồi mới tới tầng TLS: `NIOSSLHandler`
+            // Lắp NGƯỜI BÁO CÁO TRƯỚC, rồi mới tới tầng TLS: `NIOSSLHandler`
             // bắt đầu handshake ngay trong `handlerAdded` nếu channel đang
             // active, nên nếu lắp ngược thì một lỗi phát sinh ở đúng lệnh gọi
             // đó sẽ không có ai ở dưới để nghe.
-            let errorReporter = ClientTLSErrorHandler(
+            let errorReporter = MITMSessionReporter(
                 host: host, transactionID: transactionID, sink: sink
             )
             try sync.addHandler(errorReporter, position: .before(self))
@@ -173,7 +173,7 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
     /// lại nguyên nhân rồi đóng.
     ///
     /// Đây là channel CHƯA có TLS, nên `close` ở đây không dính vào cửa sổ
-    /// "NIOSSLHandler vứt write im lặng" — xem chú thích ở `ClientTLSErrorHandler`.
+    /// "NIOSSLHandler vứt write im lặng" — xem `GuardedPeer.closeAfterPendingWrites`.
     private func abort(on channel: Channel, message: String) {
         guard !isFinished else { return }
         isFinished = true
@@ -182,31 +182,37 @@ final class MITMUpgradeHandler: ChannelInboundHandler, RemovableChannelHandler {
     }
 }
 
-/// Bắt lỗi handshake ở phía CLIENT, ngay dưới `NIOSSLServerHandler`.
+/// Người báo cáo DUY NHẤT cho transaction CONNECT của một phiên MitM, ngồi ngay
+/// dưới `NIOSSLServerHandler`. Nó phát đúng MỘT event kết thúc, và chốt
+/// `hasReportedTerminal` là thứ bảo đảm điều đó.
 ///
-/// Đây là lỗi gặp nhiều nhất khi bắt app thật: app pin certificate, thấy leaf
-/// do proxy mint ra và bắn TLS alert. Một chuỗi `NIOSSLError` thô không nói cho
-/// người dùng biết phải làm gì — thứ họ cần là "thêm host này vào bypass list".
+/// Hai kết cục:
 ///
-/// CHỈ báo cho `NIOSSLError.handshakeFailed`, và đây là phần quan trọng nhất
-/// của handler này: `NIOSSLHandler.channelInactive` bắn
-/// `NIOSSLError.uncleanShutdown` mỗi khi peer đóng TCP mà không gửi
-/// close_notify — chuyện hoàn toàn bình thường ở cuối một phiên curl hay
-/// browser. Báo "nghi cert pinning" cho TẤT CẢ `NIOSSLError` sẽ dán nhãn hỏng
-/// lên mọi phiên MitM THÀNH CÔNG, tức đúng cái lỗi "công cụ nói dối về thứ nó
-/// thấy" mà cả module này được viết ra để chặn — chỉ đổi chiều.
+/// - **Bắt tay hỏng** → `.failed` kèm hướng xử lý. Đây là kết cục hay gặp nhất
+///   khi bắt app thật.
+/// - **Kết nối đóng mà chưa ai báo gì** → `.completed` với CHÍNH response
+///   `200 Connection Established` mà proxy đã gửi. Thiếu nhánh này thì MỌI kết
+///   nối HTTPS để lại một dòng `.pending` treo vĩnh viễn, kể cả khi các request
+///   bên trong nó đều hoàn tất đẹp — công cụ hiển thị một trạng thái không đúng
+///   sự thật, đúng lớp lỗi cả module này tồn tại để chặn.
+///
+/// CHỈ báo `.failed` cho `NIOSSLError.handshakeFailed`, và đây là phần quan
+/// trọng nhất: `NIOSSLHandler.channelInactive` bắn `NIOSSLError.uncleanShutdown`
+/// mỗi khi peer đóng TCP mà không gửi close_notify — chuyện hoàn toàn bình
+/// thường ở cuối một phiên curl hay browser. Báo lỗi cho TẤT CẢ `NIOSSLError`
+/// sẽ dán nhãn hỏng lên mọi phiên MitM THÀNH CÔNG.
 ///
 /// KHÔNG tự đóng channel: mọi đường `NIOSSLHandler` bắn `handshakeFailed` đều
 /// gọi `channelClose` ngay sau đó (`doHandshakeStep` nhánh `.failed`), còn
 /// đường `channelInactive` thì channel đã chết rồi. Đóng thêm một lần nữa chỉ
 /// là chen ngang một thủ tục shutdown đang chạy.
-final class ClientTLSErrorHandler: ChannelInboundHandler {
+final class MITMSessionReporter: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
     private let host: String
     private let transactionID: UUID
     private let sink: TrafficEventSink
-    private var hasReported = false
+    private var hasReportedTerminal = false
 
     init(host: String, transactionID: UUID, sink: @escaping TrafficEventSink) {
         self.host = host
@@ -215,8 +221,8 @@ final class ClientTLSErrorHandler: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        if !hasReported, let message = Self.pinningHint(for: error, host: host) {
-            hasReported = true
+        if !hasReportedTerminal, let message = Self.handshakeFailureMessage(for: error, host: host) {
+            hasReportedTerminal = true
             sink(.failed(id: transactionID, message: message, endedAt: Date()))
         }
         // Vẫn cho lỗi đi tiếp: nuốt nó ở đây sẽ giấu mất thông tin của các
@@ -224,15 +230,39 @@ final class ClientTLSErrorHandler: ChannelInboundHandler {
         context.fireErrorCaught(error)
     }
 
+    /// Chạy SAU `errorCaught` trong mọi đường lỗi của `NIOSSLHandler`
+    /// (`channelInactive` của nó `fireErrorCaught` rồi mới `fireChannelInactive`),
+    /// nên chốt đã được đặt và nhánh này không ghi đè một `.failed` có thật.
+    func channelInactive(context: ChannelHandlerContext) {
+        if !hasReportedTerminal {
+            hasReportedTerminal = true
+            sink(.completed(id: transactionID, ConnectEstablished.responseModel,
+                            endedAt: Date()))
+        }
+        context.fireChannelInactive()
+    }
+
     /// `nil` nghĩa là "không phải lỗi bắt tay phía client" — xem chú thích trên
     /// kiểu này để biết vì sao im lặng ở đó là bắt buộc.
-    static func pinningHint(for error: Error, host: String) -> String? {
+    ///
+    /// Message nêu HIỆN TƯỢNG trước, rồi mới đưa nguyên nhân KHẢ DĨ. Đây không
+    /// phải chuyện văn phong: hàm này bắn cho MỌI `handshakeFailed` phía server,
+    /// trong đó có "client không nói TLS chút nào", "không có phiên bản TLS
+    /// chung", "không có cipher chung", và "client mở CONNECT rồi bỏ đi"
+    /// (`eofDuringHandshake`). Mở đầu bằng "client từ chối certificate" là
+    /// khẳng định một chẩn đoán mà chỗ này không có dữ kiện để đưa ra — cùng
+    /// nguyên tắc đã áp dụng cho message của `handlerRemoved` bên
+    /// `HTTPProxyHandler`: nêu thứ mình BIẾT, đừng đoán nguyên nhân.
+    static func handshakeFailureMessage(for error: Error, host: String) -> String? {
         guard let sslError = error as? NIOSSLError,
               case .handshakeFailed = sslError
         else { return nil }
-        return "client từ chối certificate proxy mint cho \(host) — nghi cert "
-             + "pinning (hoặc máy chưa trust CA của proxy). Thêm \(host) vào "
-             + "bypass list để tunnel thẳng không giải mã, hoặc trust CA rồi "
-             + "thử lại. Lỗi gốc: \(error)"
+        return "bắt tay TLS với client hỏng cho \(host), nên không MitM được kết "
+             + "nối này. Nguyên nhân hay gặp nhất là cert pinning: app từ chối "
+             + "leaf do proxy mint. Cũng có thể máy chưa trust CA của proxy, "
+             + "client không nói TLS, hoặc hai bên không có phiên bản/cipher "
+             + "chung. Cách đi tiếp: thêm \(host) vào bypass list để tunnel thẳng "
+             + "không giải mã, hoặc trust CA của proxy rồi thử lại. "
+             + "Lỗi gốc: \(error)"
     }
 }

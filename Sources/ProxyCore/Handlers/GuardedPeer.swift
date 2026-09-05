@@ -1,4 +1,5 @@
 import NIOCore
+import NIOSSL
 
 /// Cờ "chiều RA của channel này đã đóng chưa", sống trên ĐÚNG một channel.
 ///
@@ -28,7 +29,9 @@ import NIOCore
 /// ở `.first`, tức DƯỚI tầng TLS, nên nó chỉ thấy `outputClosed` khi SOCKET
 /// nửa-đóng ở cuối thủ tục shutdown TLS. Cửa sổ giữa hai mốc đó nằm ngoài tầm
 /// nhìn của cờ này. Kết luận đang được giữ: KHÔNG nửa-đóng chiều ra của một
-/// channel có TLS (đường MitM không gọi `closeAfterPendingWrites` ở đâu cả).
+/// channel có TLS — và nó được ÉP bằng một `precondition` ở đầu
+/// `closeAfterPendingWrites` (tìm `NIOSSLHandler` trong pipeline), không phải
+/// bằng ràng buộc `Part == ByteBuffer`, vốn là phantom và không kiểm được gì.
 ///
 /// `@unchecked Sendable` có cơ sở chứ không phải để làm ngơ: mọi lần đọc/ghi cờ
 /// đều nằm trên event loop của channel — `userInboundEventTriggered` theo định
@@ -78,6 +81,20 @@ final class OutputLiveness: ChannelInboundHandler, @unchecked Sendable {
         }
         context.fireUserInboundEventTriggered(event)
     }
+}
+
+/// Pipeline của `channel` có tầng TLS không.
+///
+/// Tách ra khỏi `precondition` gọi nó vì phần dễ sai nằm ở phép so KIỂU, không
+/// ở chỗ gọi: `NIOSSLServerHandler` và `NIOSSLClientHandler` là LỚP CON của
+/// `NIOSSLHandler`, nên hàm này chỉ đúng nếu `handler(type:)` so bằng
+/// `is`/dynamic cast chứ không phải so kiểu chính xác. Nó có: NIO cài
+/// `_contextSync(handlerType:)` bằng `{ $0.handler is Handler }`. Một
+/// `precondition` không test được (nó làm sập tiến trình), còn hàm này thì
+/// được — xem `ConnectTunnelTests`.
+func channelHasTLSLayer(_ channel: Channel) -> Bool {
+    channel.eventLoop.preconditionInEventLoop()
+    return (try? channel.pipeline.syncOperations.handler(type: NIOSSLHandler.self)) != nil
 }
 
 /// Một channel "phía bên kia" mà handler này ghi vào, với `Channel` bị giấu kín.
@@ -279,17 +296,34 @@ extension GuardedPeer where Part == ByteBuffer {
     /// chiều ra là ngữ nghĩa của TUNNEL. Với một channel HTTP thì nó sai — sau
     /// khi FIN đi rồi ta không còn nói được gì với client nữa, kể cả một lỗi.
     ///
-    /// Kể từ Task 8, ràng buộc đó gánh thêm một việc thứ hai và ĐỪNG NỚI NÓ RA:
-    /// nó là thứ duy nhất giữ cho hàm này không bao giờ chạy trên một channel
-    /// CÓ TLS. `NIOSSLHandler.closeOutput` đặt state `.outputClosed` của chính
-    /// nó ngay ở ĐẦU thủ tục, và từ giây đó `bufferWrite` fail mọi write bằng
+    /// **KHÔNG được chạy trên một channel có `NIOSSLHandler`**, và kể từ Task 8
+    /// điều đó được ép bằng một `precondition` ở dòng đầu chứ KHÔNG bằng ràng
+    /// buộc `Part == ByteBuffer`. Vì sao ràng buộc kiểu không đủ, nói thẳng:
+    /// `Part` là tham số PHANTOM — `GuardedPeer` chỉ giữ một `Channel`, không có
+    /// gì buộc `Part` phải khớp kiểu message outbound của channel đó, và từ khi
+    /// hàm này thôi ghi thì một `Part` sai còn chẳng hỏng lúc chạy. Chính
+    /// codebase này đã có sẵn khuôn mẫu phá được nó:
+    /// `ConnectTunnelHandler.handlerAdded` dựng `GuardedPeer<ByteBuffer>` cho
+    /// channel client bằng một tham số kiểu tường minh, đúng để mở khoá hàm
+    /// này. Ai làm y hệt vậy trên một channel MitM sẽ biên dịch được và chạy
+    /// được.
+    ///
+    /// Thứ hàm này sẽ làm hỏng nếu chạy trên channel TLS:
+    /// `NIOSSLHandler.closeOutput` đặt state `.outputClosed` của CHÍNH NÓ ngay ở
+    /// ĐẦU thủ tục, và từ giây đó `bufferWrite` fail mọi write bằng
     /// `ChannelError.outputClosed` — với `promise: nil` là byte biến mất im
     /// lặng. `OutputLiveness` ngồi ở `.first`, tức DƯỚI tầng TLS, nên nó chỉ
-    /// biết chuyện đó khi SOCKET nửa-đóng ở cuối thủ tục shutdown TLS; cả cửa
-    /// sổ giữa hai mốc là mù. Đường MitM vì thế chỉ dùng
-    /// `GuardedPeer<HTTPServerResponsePart>` / `<HTTPClientRequestPart>` cho hai
-    /// channel có TLS của nó, nên hàm này không gọi được ở đó — theo kiểu, chứ
-    /// không theo một quy ước ai đó phải nhớ.
+    /// biết chuyện đó khi SOCKET nửa-đóng ở CUỐI thủ tục shutdown TLS; cả cửa sổ
+    /// giữa hai mốc là mù, và cái watchdog xả bên dưới cũng mù theo.
+    ///
+    /// `precondition` chứ không phải ngả về đóng hẳn: đây là lỗi lập trình, chỉ
+    /// tới được bằng một dòng code mới, không tới được bằng input từ xa (không
+    /// có đường nào cho peer lắp `NIOSSLHandler` vào pipeline của một tunnel
+    /// mù). Ngả về một hành vi "an toàn" nào đó chính là kiểu im lặng mà cả file
+    /// này sinh ra để chặn.
+    ///
+    /// Ràng buộc `Part == ByteBuffer` vẫn giữ, nhưng chỉ vì lý do NGỮ NGHĨA nêu
+    /// ở đoạn trên — nó không phải, và chưa bao giờ là, một phép kiểm.
     ///
     /// `onDrainAbandoned` KHÔNG có giá trị mặc định, cùng lý do với việc `write`
     /// không `@discardableResult`: bỏ cuộc giữa lúc xả là CẮT CỤT, và một lần
@@ -302,7 +336,19 @@ extension GuardedPeer where Part == ByteBuffer {
                                  lingerTimeout: TimeAmount = .seconds(15),
                                  onDrainAbandoned: @escaping (Int) -> Void) {
         let channel = self.channel
-        channel.eventLoop.assertInEventLoop()
+        // `precondition`, không phải `assert`: `markOutputClosed()` bên dưới là
+        // lần ghi CHỦ ĐỘNG duy nhất vào `OutputLiveness.isOutputClosed`, tức
+        // chính là chỗ mà cơ sở `@unchecked Sendable` của kiểu đó dựa vào. Một
+        // `assert` (`debugOnly`) để hở đúng chỗ đó trong release.
+        channel.eventLoop.preconditionInEventLoop()
+        // Xem khối doc ở trên: ràng buộc `Part == ByteBuffer` là ngữ nghĩa, KHÔNG
+        // phải phép kiểm (`Part` là phantom). Đây mới là phép kiểm.
+        precondition(
+            !channelHasTLSLayer(channel),
+            "closeAfterPendingWrites không dùng được trên channel có NIOSSLHandler: "
+            + "NIOSSLHandler.closeOutput vứt write im lặng trong suốt thủ tục shutdown TLS, "
+            + "và OutputLiveness (ở .first, dưới tầng TLS) không thấy cửa sổ đó."
+        )
         guard channel.isActive else {
             channel.close(promise: nil)
             return
@@ -310,8 +356,22 @@ extension GuardedPeer where Part == ByteBuffer {
         guard !output.isOutputClosed else {
             // Đã có một lượt nửa-đóng cho channel này. KHÔNG được đóng cứng
             // chồng lên: lượt đầu có thể đang xả, và cắt ngang nó chính là cái
-            // mất byte cả hàm này sinh ra để tránh. Lượt đầu cũng đã hẹn giờ
-            // nán, nên không có gì bị bỏ dở.
+            // mất byte cả hàm này sinh ra để tránh.
+            //
+            // "Lượt đầu đã hẹn giờ nán nên không có gì bị bỏ dở" chỉ ĐÚNG khi cờ
+            // được đặt bởi CHÍNH hàm này. Hai đường đặt cờ còn lại thì không hẹn
+            // gì cả, và hôm nay cả hai đều không tới được đây với một channel còn
+            // sống — nói cho chính xác thay vì phát biểu chung chung:
+            //
+            // - `OutputLiveness.attached` fallback (`isOutputClosed = true` khi
+            //   `addHandler` ném): chỉ ném khi pipeline đã đóng, tức
+            //   `channel.isActive == false` — guard ngay phía trên bắt trước và
+            //   vẫn đóng hẳn channel.
+            // - `ChannelEvent.outputClosed`: NIO chỉ bắn nó từ
+            //   `close0(mode: .output)`, mà trên các channel tunnel (nơi duy nhất
+            //   hàm này chạy được) `closeAfterPendingWrites` là chỗ DUY NHẤT gọi
+            //   nửa-đóng. Nếu ai đó thêm một đường nửa-đóng khác, đường đó phải
+            //   tự đặt hạn treo của nó — ở đây không có hạn nào.
             return
         }
         // Từ NGAY đây mọi `write` vào peer này trả `false` thay vì im lặng biến

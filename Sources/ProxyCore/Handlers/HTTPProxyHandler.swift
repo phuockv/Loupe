@@ -38,30 +38,28 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     /// — mà `sink` là closure do người gọi truyền vào, và Task 7/8 còn gắn
     /// thêm handler vào pipeline này: cả hai đều có thể phá lập luận đó mà
     /// không sửa một dòng nào trong file này.
+    ///
+    /// Bản thân cái guard giờ nằm trong `GuardedPeer` (Task 7), dùng chung với
+    /// tunnel mù — cùng một kỷ luật, một bản cài đặt duy nhất. Struct này chỉ
+    /// còn ghép nó với `target`; bề mặt bên ngoài không đổi.
     struct UpstreamConnection {
-        private let channel: Channel
+        private let peer: GuardedPeer<HTTPClientRequestPart>
         let target: Target
 
         init(channel: Channel, target: Target) {
-            self.channel = channel
+            self.peer = GuardedPeer(channel: channel)
             self.target = target
         }
 
-        var isActive: Bool { channel.isActive }
+        var isActive: Bool { peer.isActive }
 
-        func close() { channel.close(promise: nil) }
+        func close() { peer.close() }
 
         /// Ghi một part ra upstream; trả `false` — và KHÔNG ghi gì — nếu
         /// channel đã chết. Cố ý KHÔNG `@discardableResult`: bỏ qua giá trị
         /// trả về chính là bỏ qua tín hiệu mà cả lớp bug này xoay quanh.
         func write(_ part: HTTPClientRequestPart, flush: Bool) -> Bool {
-            guard channel.isActive else { return false }
-            if flush {
-                channel.writeAndFlush(NIOAny(part), promise: nil)
-            } else {
-                channel.write(NIOAny(part), promise: nil)
-            }
-            return true
+            peer.write(part, flush: flush)
         }
     }
 
@@ -154,6 +152,56 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         upstream?.close()
         upstream = nil
         context.fireChannelInactive()
+    }
+
+    /// Handler bị GỠ khỏi pipeline trong khi channel client vẫn sống: đó là
+    /// lúc một `CONNECT` biến kết nối này thành tunnel byte thô
+    /// (`ProxyEntryHandler.switchToTunnel`). Trường hợp tới được đây trong
+    /// thực tế: client gửi một request plaintext rồi `CONNECT` trên CÙNG một
+    /// kết nối — pipeline hoá thì cả hai vào chung một lượt đọc, nên ta bị gỡ
+    /// đúng lúc còn một connect upstream đang bay và việc đọc từ client đang
+    /// tạm dừng.
+    ///
+    /// Ba việc, và THỨ TỰ hai việc đầu là bắt buộc:
+    ///
+    /// 1. Rút HẾT transaction đang chờ khỏi `state` và tự phát `.failed` cho
+    ///    chúng. Chúng thật sự hỏng: response của một request pipeline hoá
+    ///    không bao giờ giao được nữa vì kết nối đã thành tunnel. Đây KHÔNG
+    ///    phải "người báo cáo thứ hai" chen vào phần của
+    ///    `UpstreamHandler.channelInactive` (nơi duy nhất báo cáo upstream
+    ///    CHẾT): nguyên nhân ở đây là bỏ dở, và ta rút khỏi `state` trước nên
+    ///    hàm kia thấy hàng đợi rỗng và im lặng.
+    /// 2. ...rồi mới đóng upstream. Đảo thứ tự là crash chứ không phải lỗi
+    ///    nhẹ: đóng upstream chạy `UpstreamHandler.channelInactive`, nó thấy
+    ///    transaction còn chờ nên ghi một 502 (`HTTPServerResponsePart`) vào
+    ///    channel client — mà encoder HTTP vừa bị gỡ khỏi channel đó, nên
+    ///    NIO `fatalError` khi unwrap kiểu ở đáy pipeline.
+    /// 3. Trả lại `autoRead` nếu đang tạm dừng. Bắt buộc vì dòng đầu đặt
+    ///    `isClientGone = true`, khiến closure connect (nơi bình thường gọi
+    ///    `resumeClientReads`) bỏ qua mọi việc — không mở lại ở đây thì
+    ///    handler tunnel kế nhiệm không bao giờ đọc được byte nào từ client.
+    ///
+    /// `isClientGone` bật lên vì với handler này, "bị gỡ" và "client biến mất"
+    /// là một: connect còn đang bay phải tự đóng channel vừa mở thay vì ghi
+    /// request part (hoặc một 502) vào một channel giờ đã chở byte thô.
+    ///
+    /// Hàm này cũng chạy khi channel đóng bình thường. Thường thì
+    /// `channelInactive` đã chạy trước và `UpstreamHandler` dọn sạch `state`,
+    /// nên vòng lặp không chạy lần nào — không có `.failed` trùng lặp. Ngoại
+    /// lệ là client ngắt trong lúc connect còn đang bay (chưa có
+    /// `UpstreamHandler` nào để dọn): khi đó vòng lặp ở đây phát `.failed` cho
+    /// transaction bỏ dở, nên message phải nêu HIỆN TƯỢNG chứ không đoán
+    /// nguyên nhân — cả hai lối vào đều dùng chung một câu.
+    func handlerRemoved(context: ChannelHandlerContext) {
+        isClientGone = true
+        while let abandoned = state.dequeue() {
+            sink(.failed(id: abandoned.id,
+                         message: "request bị bỏ dở trước khi nhận được response",
+                         endedAt: Date()))
+        }
+        upstream?.close()
+        upstream = nil
+        resumeClientReads(channel: context.channel)
     }
 
     private func handle(head: HTTPRequestHead, context: ChannelHandlerContext) {

@@ -6,7 +6,6 @@ import TrafficModel
 /// Nhận response từ origin, chuyển tiếp về client, và ghi lại transaction.
 final class UpstreamHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPClientResponsePart
-    typealias OutboundOut = HTTPClientRequestPart
 
     private let clientChannel: Channel
     private let configuration: ProxyConfiguration

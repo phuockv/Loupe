@@ -3,16 +3,12 @@ import TrafficModel
 
 /// Tab Request/Response cho transaction đang được chọn trong bảng.
 ///
-/// Thứ tự kiểm tra trong `responseTab` là phần quan trọng nhất của view này:
-/// `isTunnelled` phải được xét TRƯỚC `state`/`response`. Một CONNECT bị bypass
-/// vẫn phát `.completed` kèm một response tổng hợp ("200 Connection
-/// Established", `Content-Length: 0`) khi tunnel đóng sạch — response đó tả
-/// đúng cái proxy trả lời CHO LỆNH CONNECT, không phải cho bất kỳ request nào
-/// chạy BÊN TRONG tunnel, vì proxy không đọc được những request đó (xem
-/// `ConnectEstablished`/`ProxyEntryHandler` ở `ProxyCore`). Nếu tab này ưu
-/// tiên `response != nil` trước, nó sẽ hiện "200, body rỗng, completed" như
-/// thể server không trả gì — đúng kết luận sai mà `Transaction.isTunnelled`
-/// tồn tại để ngăn, xem doc comment của nó trong `TrafficModel/Models.swift`.
+/// Quyết định hiện gì ở tab Response nằm trong `ResponsePresentation`
+/// (bên dưới), KHÔNG nằm rải rác trong `body` — xem doc comment của nó để
+/// biết vì sao thứ tự ưu tiên trong đó (isTunnelled → response → failed →
+/// pending) là phần quan trọng nhất của cả file này, và vì sao review vòng 1
+/// tìm ra chỗ cùng một lớp lỗi (giấu mất `.failed`) còn sót lại ở đường
+/// không-tunnelled sau khi override 1 chỉ sửa đường tunnelled.
 public struct InspectorView: View {
     let transaction: TrafficModel.Transaction
     @State private var selectedTab: Tab = .request
@@ -82,17 +78,33 @@ public struct InspectorView: View {
 
     @ViewBuilder
     private var responseTab: some View {
+        let presentation = ResponsePresentation(
+            isTunnelled: transaction.isTunnelled,
+            state: transaction.state,
+            response: transaction.response
+        )
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                if transaction.isTunnelled {
-                    tunnelledUnavailable
-                } else if let response = transaction.response {
-                    LabeledContent("Status", value: "\(response.statusCode) \(response.reasonPhrase)")
-                    InspectorSection("Headers") { KeyValueTable(pairs: response.headers) }
-                    InspectorSection("Body") { BodyView(payload: response.body) }
-                } else if case .failed(let reason) = transaction.state {
-                    failedUnavailable(reason: reason)
-                } else {
+                switch presentation.kind {
+                case .tunnelled:
+                    tunnelledUnavailable(failureReason: presentation.failureReason)
+
+                case .response(let statusCode, let reasonPhrase):
+                    if let response = transaction.response {
+                        LabeledContent("Status", value: "\(statusCode) \(reasonPhrase)")
+                        if let reason = presentation.failureReason {
+                            partialResponseFailureNotice(reason)
+                        }
+                        InspectorSection("Headers") { KeyValueTable(pairs: response.headers) }
+                        InspectorSection("Body") { BodyView(payload: response.body) }
+                    }
+
+                case .failed:
+                    if let reason = presentation.failureReason {
+                        failedUnavailable(reason: reason)
+                    }
+
+                case .pending:
                     ProgressView("Đang chờ response")
                         .padding(.top, 40)
                         .frame(maxWidth: .infinity)
@@ -105,12 +117,12 @@ public struct InspectorView: View {
     }
 
     /// Host nằm trong bypass list: PHẢI nói rõ ngay, không đợi người dùng tự
-    /// suy ra từ một body rỗng. Nếu `state` cũng là `.failed` (tunnel relay
-    /// thật sự hỏng, chứ không chỉ "không giải mã"), hiện thêm lý do đó bên
+    /// suy ra từ một body rỗng. Nếu tunnel relay cũng `.failed` (chứ không chỉ
+    /// "không giải mã"), `failureReason` khác nil và hiện thêm lý do đó bên
     /// dưới — mất thông tin đó cũng tệ không kém việc giấu sự thật "chưa từng
     /// giải mã".
     @ViewBuilder
-    private var tunnelledUnavailable: some View {
+    private func tunnelledUnavailable(failureReason: String?) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Không giải mã", systemImage: "lock.slash")
                 .font(.title3.bold())
@@ -123,10 +135,10 @@ public struct InspectorView: View {
             """)
             .foregroundStyle(.secondary)
 
-            if case .failed(let reason) = transaction.state {
+            if let failureReason {
                 Divider()
                 Text("Tunnel relay cũng thất bại:").font(.subheadline).bold()
-                failureReasonText(reason)
+                failureReasonText(failureReason)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -149,9 +161,85 @@ public struct InspectorView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Review vòng 1: `UpstreamHandler` phát `.responseHead` (header thật,
+    /// `body: .none`) ngay khi origin trả xong header, TRƯỚC khi body tải
+    /// xong; nếu origin đóng kết nối giữa chừng sau đó, `.failed` phát ra mà
+    /// KHÔNG đụng tới `response` đã ghi. Kết quả: `response != nil` VÀ
+    /// `state == .failed` cùng lúc, y hệt lớp lỗi override 1 sửa cho đường
+    /// tunnelled nhưng chừa lại ở đây. Notice này hiện NGAY TRÊN header/body
+    /// thật, không thay thế chúng: response một phần cộng lý do thất bại hữu
+    /// ích hơn hẳn chỉ một trong hai.
+    @ViewBuilder
+    private func partialResponseFailureNotice(_ reason: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Response chưa hoàn tất", systemImage: "exclamationmark.triangle")
+                .font(.subheadline.bold())
+                .foregroundStyle(.orange)
+            failureReasonText(reason)
+        }
+    }
+
     private func failureReasonText(_ reason: String) -> some View {
         Text(reason)
             .font(.system(.body, design: .monospaced))
+    }
+}
+
+/// Suy diễn thuần logic những gì tab Response cần hiển thị, tách khỏi
+/// SwiftUI để test được không cần dựng view thật — cùng cách
+/// `StatusPresentation` (`ContentView.swift`) làm cho `StatusCell`.
+///
+/// Thứ tự ưu tiên, ĐÚNG THEO THỨ TỰ:
+/// 1. `isTunnelled` → `.tunnelled`. Một CONNECT bị bypass vẫn phát `.completed`
+///    kèm response tổng hợp ("200 Connection Established") khi tunnel đóng
+///    sạch — response đó tả cái proxy trả lời CHO LỆNH CONNECT, không phải
+///    cho bất kỳ request nào chạy BÊN TRONG tunnel, vì proxy không đọc được
+///    những request đó (xem `ConnectEstablished`/`ProxyEntryHandler` ở
+///    `ProxyCore`). Ưu tiên `response` trước sẽ hiện "200, body rỗng,
+///    completed" như thể server không trả gì.
+/// 2. `response != nil` → `.response`. QUAN TRỌNG: xét TRƯỚC `state == .failed`.
+///    `UpstreamHandler` phát `.responseHead` (header thật, `body: .none`)
+///    ngay khi origin trả xong dòng đầu, trước khi body tải xong; nếu origin
+///    chết giữa chừng sau đó, `.failed` phát ra mà không đụng tới `response`
+///    đã ghi — nghĩa là `response != nil` VÀ `state == .failed` có thể cùng
+///    đúng cho một request bình thường, không chỉ cho tunnel. Xét
+///    `state == .failed` trước ở đây sẽ giấu mất response thật đã nhận được;
+///    ngược lại xét `response` trước mà bỏ qua `failureReason` sẽ giấu mất
+///    sự thật request đã thất bại — nên `failureReason` được tính ĐỘC LẬP và
+///    lộ ra CÙNG với `.response`, không đánh đổi cái này lấy cái kia.
+/// 3. Còn `state == .failed` mà không có response → `.failed`.
+/// 4. Còn lại → `.pending`.
+struct ResponsePresentation: Equatable {
+    enum Kind: Equatable {
+        case tunnelled
+        case response(statusCode: Int, reasonPhrase: String)
+        case failed
+        case pending
+    }
+
+    let kind: Kind
+    /// Lý do thất bại nếu `state == .failed`, tính ĐỘC LẬP với `kind` — có
+    /// thể khác nil dù `kind` là `.tunnelled` (tunnel relay hỏng) hay
+    /// `.response` (response một phần rồi origin chết) chứ không chỉ khi
+    /// `kind == .failed`.
+    let failureReason: String?
+
+    init(isTunnelled: Bool, state: TransactionState, response: ResponseModel?) {
+        if case .failed(let reason) = state {
+            failureReason = reason
+        } else {
+            failureReason = nil
+        }
+
+        if isTunnelled {
+            kind = .tunnelled
+        } else if let response {
+            kind = .response(statusCode: response.statusCode, reasonPhrase: response.reasonPhrase)
+        } else if failureReason != nil {
+            kind = .failed
+        } else {
+            kind = .pending
+        }
     }
 }
 

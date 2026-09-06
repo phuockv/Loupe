@@ -109,6 +109,7 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
                     upstreamVanished()
                     return
                 }
+                reporter.recordSent(buffer.readableBytes)
             }
 
         case .failure(let error):
@@ -139,9 +140,13 @@ final class ConnectTunnelHandler: ChannelInboundHandler {
         // Ghi bị từ chối = upstream đã chết. Tunnel mù không có gì để thử lại
         // và không có cách nào báo lỗi trong băng (client đang nói TLS), nên
         // đóng nốt phía client để nó BIẾT — thay vì im lặng nuốt byte.
-        if !upstream.write(buffer, flush: true) {
+        guard upstream.write(buffer, flush: true) else {
             upstreamVanished()
+            return
         }
+        // Cộng dồn SAU khi ghi được chấp nhận, cùng kỷ luật với chiều kia
+        // (xem `TunnelReporter.bytesSent`): buffer bị từ chối không được tính.
+        reporter.recordSent(buffer.readableBytes)
     }
 
     /// Client đóng kết nối. `closeAfterPendingWrites` chứ không phải đóng
@@ -273,12 +278,6 @@ final class TunnelRelayHandler: ChannelInboundHandler {
     /// `ConnectTunnelHandler.client`: `closeAfterPendingWrites` chỉ tồn tại
     /// trên `GuardedPeer<ByteBuffer>`, và đó là ràng buộc muốn giữ.
     private var upstream: GuardedPeer<ByteBuffer>?
-    /// Chỉ để BÁO CÁO, và chỉ đếm phần channel client ĐÃ NHẬN — cộng dồn trước
-    /// khi ghi thì mỗi buffer bị `client.write` từ chối vẫn được tính, và con
-    /// số ta trích dẫn trong `.failed` thành ra to hơn thứ thật sự đã chuyển.
-    /// Với một tunnel mù thì đây là con số duy nhất ta biết chắc, nên nó không
-    /// được phép nói quá.
-    private var bytesRelayedToClient = 0
     /// Tunnel đã kết thúc ở chân này. Ảnh gương của
     /// `ConnectTunnelHandler.isFinished`: chặn đếm tiếp sau khi client đã biến
     /// mất, và chặn xếp hàng hai lượt nửa-đóng cho cùng một channel.
@@ -307,7 +306,7 @@ final class TunnelRelayHandler: ChannelInboundHandler {
             drainUpstream()
             return
         }
-        bytesRelayedToClient += buffer.readableBytes
+        reporter.recordReceived(buffer.readableBytes)
     }
 
     /// Upstream đóng — với HTTP qua tunnel thì đây là kết thúc BÌNH THƯỜNG của
@@ -384,7 +383,7 @@ final class TunnelRelayHandler: ChannelInboundHandler {
         // watchdog xả cắt ngang, và khi đó phần còn tồn bị vứt.
         reporter.reportFailure(
             "lỗi ở chân upstream của tunnel — \(error); đã chuyển được "
-            + "\(bytesRelayedToClient) byte sang channel client (chưa chắc đã ra hết tới "
+            + "\(reporter.bytesReceived) byte sang channel client (chưa chắc đã ra hết tới "
             + "client: phần còn tồn đang được xả và có thể bị cắt nếu client ngừng nhận). "
             + "Tunnel mù không đọc được nội dung nên không phân biệt được origin đã gửi "
             + "xong hay bị cắt giữa chừng."
@@ -417,12 +416,36 @@ final class TunnelReporter {
     private let transactionID: UUID
     private let sink: TrafficEventSink
     private var hasReported = false
+    /// Chốt riêng cho `.bytesRelayed`: nó được phát KHÔNG phụ thuộc
+    /// `hasReported` (xem `legClosed`), nên nó cần chốt của chính nó.
+    private var hasReportedBytes = false
     /// Số chân tunnel đã dựng mà chưa đóng hẳn. Xem `legClosed`.
     private var openLegs = 0
+
+    /// Byte đã relay, đếm ở ĐÂY chứ không ở hai handler: cả `.failed` của chân
+    /// upstream lẫn event `.bytesRelayed` lúc đóng đều trích dẫn cùng con số
+    /// này, và hai bản đếm song song thì sớm muộn cũng lệch nhau.
+    ///
+    /// Cả hai chỉ được cộng dồn SAU khi peer channel đã CHẤP NHẬN buffer —
+    /// cộng trước khi ghi thì mỗi buffer bị từ chối vẫn được tính, và con số
+    /// ta công bố thành ra to hơn thứ thật sự đã chuyển. Với một tunnel mù thì
+    /// đây là con số duy nhất ta biết chắc, nên nó không được phép nói quá.
+    private(set) var bytesSent = 0
+    private(set) var bytesReceived = 0
 
     init(transactionID: UUID, sink: @escaping TrafficEventSink) {
         self.transactionID = transactionID
         self.sink = sink
+    }
+
+    /// Client → origin, đã được channel upstream nhận.
+    func recordSent(_ count: Int) {
+        bytesSent += count
+    }
+
+    /// Origin → client, đã được channel client nhận.
+    func recordReceived(_ count: Int) {
+        bytesReceived += count
     }
 
     func reportFailure(_ message: String) {
@@ -448,7 +471,17 @@ final class TunnelReporter {
     /// thì mọi lượt xả hoặc đã xong, hoặc đã kịp báo.
     func legClosed() {
         openLegs -= 1
-        guard openLegs <= 0, !hasReported else { return }
+        guard openLegs <= 0 else { return }
+        // Byte đã relay được phát KHÔNG phụ thuộc chốt `hasReported`: một
+        // tunnel đã bị báo `.failed` vẫn đã chở byte, và với một tunnel mù thì
+        // đó thường là thông tin duy nhất còn lại để hiểu nó hỏng ở đâu. Phát
+        // ở đây (chân CUỐI) chứ không sớm hơn vì tới lúc đó mới không còn
+        // chiều nào cộng thêm được nữa.
+        if !hasReportedBytes {
+            hasReportedBytes = true
+            sink(.bytesRelayed(id: transactionID, sent: bytesSent, received: bytesReceived))
+        }
+        guard !hasReported else { return }
         hasReported = true
         // Response THẬT mà proxy đã gửi cho CONNECT này, không phải một giá trị
         // tổng hợp cho đẹp bảng. Thiếu event này thì MỌI kết nối HTTPS để lại

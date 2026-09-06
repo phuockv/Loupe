@@ -543,6 +543,75 @@ struct ConnectTunnelTests {
         try await client.close()
     }
 
+    /// Với một tunnel mù, số byte đã relay là con số DUY NHẤT proxy biết về
+    /// phiên đó — không có method, không có status, không có body. Nó là nguồn
+    /// duy nhất của cột Size cho những dòng này, nên nó phải là byte THẬT đã
+    /// đi qua, đo ở cả hai chiều.
+    @Test("Tunnel mù báo đúng số byte đã relay hai chiều khi đóng")
+    func reportsRelayedByteCountsWhenTunnelCloses() async throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        defer { Task { try? await group.shutdownGracefully() } }
+
+        let origin = try await startByteEchoServer(group: group)
+        defer { origin.close(promise: nil) }
+        let originPort = origin.localAddress!.port!
+
+        var config = ProxyConfiguration()
+        config.listenPort = 0
+        config.bypassedHosts = ["127.0.0.1"]
+
+        let server = ProxyServer(configuration: config, leafCache: try makeLeafCache())
+        let proxyPort = try await server.start()
+        defer { Task { try? await server.shutdown() } }
+
+        let collected = Task { () -> [TrafficEvent] in
+            var events: [TrafficEvent] = []
+            for await event in server.events {
+                events.append(event)
+                if case .bytesRelayed = event { break }
+            }
+            return events
+        }
+
+        let (client, collector) = try await connectRawClient(group: group, proxyPort: proxyPort)
+        let expectedResponse = Self.expectedConnectResponse
+        let responseFuture = expect(expectedResponse.utf8.count, from: collector, on: client)
+        try await write(Data("""
+        CONNECT 127.0.0.1:\(originPort) HTTP/1.1\r
+        Host: 127.0.0.1:\(originPort)\r
+        \r
+
+        """.utf8), to: client)
+        #expect(String(decoding: try await responseFuture.get(), as: UTF8.self) == expectedResponse)
+
+        // Origin dội ngược đúng những byte nhận được, nên hai chiều phải ra
+        // cùng một con số — và ta chỉ đọc bộ đếm SAU khi đã nhận đủ byte dội
+        // về, tức cả hai chiều chắc chắn đã chạy xong.
+        let payload = Data(repeating: 0x5A, count: 4096)
+        let echoFuture = expect(payload.count, from: collector, on: client)
+        try await write(payload, to: client)
+        #expect(try await echoFuture.get() == payload)
+
+        // Client đóng → chân client đóng → upstream được xả rồi đóng → chân
+        // CUỐI cùng đóng là lúc bộ đếm được công bố.
+        try await client.close()
+
+        guard let events = await awaitWithTimeout(collected, seconds: 5) else {
+            Issue.record("hết giờ chờ event .bytesRelayed"); return
+        }
+        let started = events.compactMap { event -> Transaction? in
+            if case .started(let transaction) = event { return transaction }
+            return nil
+        }
+        let transaction = try #require(started.first)
+        guard case .bytesRelayed(let id, let sent, let received)? = events.last else {
+            Issue.record("thiếu event .bytesRelayed, events: \(events)"); return
+        }
+        #expect(id == transaction.id)
+        #expect(sent == payload.count, "byte client→origin phải là số byte THẬT đã relay")
+        #expect(received == payload.count, "byte origin→client phải là số byte THẬT đã relay")
+    }
+
     @Test("CONNECT ngay sau một request plaintext trên cùng kết nối: tunnel vẫn relay, request dở được báo .failed")
     func tunnelRelaysAfterPipelinedPlaintextRequest() async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)

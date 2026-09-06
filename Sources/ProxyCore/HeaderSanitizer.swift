@@ -19,12 +19,15 @@ public enum HeaderSanitizer {
 
     public static func sanitize(_ headers: HTTPHeaders) -> HTTPHeaders {
         // Per RFC 9110 §7.6.1, Connection header values are also hop-by-hop.
+        //
+        // `[canonicalForm:]` chứ không phải `first(name:)`: RFC 9110 cho phép
+        // `Connection` xuất hiện trên NHIỀU dòng field, và `first` chỉ đọc
+        // dòng ĐẦU — mọi tên chỉ được nêu ở dòng sau sẽ được forward nguyên.
+        // Subscript này gộp mọi dòng lại VÀ tự tách theo dấu phẩy kèm cắt
+        // khoảng trắng, nên nó thay luôn phần `split(separator: ",")` thủ công.
         var toStrip = hopByHop
-        if let connectionValue = headers.first(name: "Connection") {
-            for field in connectionValue.split(separator: ",") {
-                let trimmed = field.trimmingCharacters(in: .whitespaces).lowercased()
-                toStrip.insert(trimmed)
-            }
+        for field in headers[canonicalForm: "Connection"] {
+            toStrip.insert(field.lowercased())
         }
 
         var result = HTTPHeaders()

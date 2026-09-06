@@ -42,10 +42,34 @@ final class UpstreamHandler: ChannelInboundHandler {
                 limit: configuration.maxInMemoryBodyBytes,
                 spillDirectory: configuration.bodySpillDirectory
             )
+            // BẢN GHI giữ header GỐC của origin, chỉ BẢN CHUYỂN TIẾP mới bị gỡ
+            // hop-by-hop — cùng hình dạng với chiều request
+            // (`HTTPProxyHandler.makeTransaction` ghi `head.headers` trong khi
+            // chỗ forward dùng `sanitize(head.headers)`). Đảo lại là công cụ
+            // hiện một response KHÁC với thứ origin đã gửi, đúng lớp lỗi cả
+            // module này tồn tại để chặn.
             if let id = state.pendingIDs.first {
                 sink(.responseHead(id: id, Self.model(from: head, body: .none)))
             }
-            guard client.write(.head(head), flush: false) else {
+            // Không gỡ thì `Connection`, `Keep-Alive`, `Trailer`, `Upgrade` và
+            // `Proxy-Authenticate` của origin đi thẳng tới client — cái cuối
+            // hiện ra như thể CHÍNH PROXY đang đòi xác thực.
+            //
+            // An toàn với framing của response HTTP/1.1: `HTTPResponseEncoder`
+            // (mặc định `automaticallySetFramingHeaders`) tự dựng lại
+            // `Transfer-Encoding: chunked` hoặc giữ `Content-Length` theo
+            // response thật trước khi ghi head ra dây, nên gỡ `Transfer-Encoding`
+            // gốc ở đây không để lại response 1.1 nào mất khung.
+            //
+            // GIỚI HẠN đã biết, và KHÔNG phải do thay đổi này sinh ra: một
+            // response HTTP/1.0 không có `Content-Length` được đóng khung bằng
+            // chính việc đóng kết nối, mà encoder không dựng khung cho phiên
+            // bản 1.0. Trước hay sau thay đổi này, client cũng đều chờ một EOF
+            // mà proxy không gửi (proxy giữ kết nối client sống sau `.end`).
+            // Ghi lại như việc cần làm tiếp, không phải một bất biến hàm này giữ.
+            var forwarded = head
+            forwarded.headers = HeaderSanitizer.sanitize(head.headers)
+            guard client.write(.head(forwarded), flush: false) else {
                 clientVanished(context: context)
                 return
             }

@@ -83,6 +83,22 @@ struct TrafficStoreTests {
         #expect(data == Data("hello".utf8))
     }
 
+    /// `.bytesRelayed` là đường DUY NHẤT `bytesSent`/`bytesReceived` được ghi
+    /// (xem doc comment của chúng), và cột Size của mọi dòng tunnel mù đọc
+    /// đúng hai trường đó. Bỏ case này khỏi `apply` là hai trường ấy ở nguyên
+    /// 0 vĩnh viễn mà không có gì đỏ.
+    @Test(".bytesRelayed ghi số byte đã relay vào đúng transaction")
+    func bytesRelayedRecordsCounters() {
+        let store = TrafficStore(capacity: 10)
+        let transaction = makeTransaction(method: "CONNECT", isTunnelled: true)
+        store.enqueue(.started(transaction))
+        store.enqueue(.bytesRelayed(id: transaction.id, sent: 4_096, received: 8_192))
+        store.flushNow()
+
+        #expect(store.transactions[0].bytesSent == 4_096)
+        #expect(store.transactions[0].bytesReceived == 8_192)
+    }
+
     @Test("isTunnelled sống sót qua .completed vì nó là let cố định từ .started, không nằm trong TransactionState")
     func isTunnelledSurvivesCompletion() {
         let store = TrafficStore(capacity: 10)

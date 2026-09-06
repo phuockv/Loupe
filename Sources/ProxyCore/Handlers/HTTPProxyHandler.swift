@@ -211,6 +211,18 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
 
     private func handle(head: HTTPRequestHead, context: ChannelHandlerContext) {
         guard let target = resolveTarget(head: head) else {
+            // Request này không forward được, nên phần `.body`/`.end` còn lại
+            // của nó phải bị NUỐT. Thiếu cờ này, chúng rơi vào
+            // `forwardOrBuffer`, thấy `upstream` còn sót lại từ một request
+            // TRƯỚC trên cùng kết nối keep-alive, và được ghi thẳng vào đó —
+            // một body không có head, tiêm vào một cuộc hội thoại đang sống
+            // với origin thật. `respond` bên dưới có đóng channel, nhưng nó
+            // đóng trong completion của một lần ghi: nếu send buffer phía
+            // client đang đầy thì lần đóng đó tới SAU khi decoder đã giao nốt
+            // body của cùng lượt đọc, và cửa sổ đó đủ để lọt.
+            isUpstreamAborted = true
+            pendingRequestID = nil
+            collector = nil
             respond(channel: context.channel, status: .badRequest,
                     message: "proxy cần absolute-form URI, nhận được: \(head.uri)")
             return
@@ -363,9 +375,13 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         // phần còn lại — không ghi, và cũng KHÔNG buffer.
         guard !isUpstreamAborted else { return }
         guard upstream == nil else {
-            // Đã có upstream: ghi qua đúng một cổng. Nếu nó đã chết,
-            // `writeUpstream` tự bỏ nốt request (không ghi gì cả).
-            writeUpstream(part, flush: flushImmediately)
+            // Đã có upstream: ghi qua đúng một cổng. `_ =` tường minh chứ
+            // không phải `@discardableResult`: bỏ qua giá trị trả về ở đây là
+            // CÓ CHỦ Ý và an toàn vì `writeUpstream` đã tự bỏ nốt request
+            // (`abandonRequestOnDeadUpstream`) trên mọi đường nó trả `false`
+            // — nhưng nó phải NHÌN THẤY ĐƯỢC là ta đang bỏ qua tín hiệu mà
+            // cả lớp bug này xoay quanh.
+            _ = writeUpstream(part, flush: flushImmediately)
             return
         }
         guard pendingUpstreamBytes + byteCount <= configuration.maxInMemoryBodyBytes else {
@@ -380,12 +396,26 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     /// (`handleUpstreamReady`) lẫn body/end (`forwardOrBuffer`) đều qua đây;
     /// `UpstreamConnection` giấu `Channel` nên không có đường nào khác.
     ///
-    /// Trả `false` khi part KHÔNG được gửi: chưa có upstream, hoặc upstream
-    /// đã chết (khi đó phần còn lại của request bị bỏ — xem
-    /// `abandonRequestOnDeadUpstream`).
-    @discardableResult
+    /// Trả `false` khi part KHÔNG được gửi: chưa có upstream, hoặc upstream đã
+    /// chết. Trong CẢ HAI trường hợp phần còn lại của request bị bỏ dở ngay
+    /// tại đây (`abandonRequestOnDeadUpstream`) — người gọi không phải dọn gì
+    /// thêm, nhưng cũng không được coi `false` là "thử lại sau".
+    ///
+    /// KHÔNG `@discardableResult`, cùng lý do với `UpstreamConnection.write`:
+    /// bỏ qua giá trị trả về phải là một câu lệnh nhìn thấy được (`_ =`), chứ
+    /// không phải mặc định im lặng.
+    ///
+    /// Nhánh `upstream == nil` hôm nay không đường nào chạm tới —
+    /// `forwardOrBuffer` đã kiểm trước, còn `handleUpstreamReady` chỉ chạy sau
+    /// khi connect gán `upstream`. Nó vẫn phải bỏ dở request thay vì chỉ trả
+    /// `false`: thứ giữ cho nó không chạm tới CHỈ là một lập luận về thứ tự ở
+    /// hai chỗ gọi, và đúng kiểu lập luận đó đã hỏng ba lần trong chính file
+    /// này.
     private func writeUpstream(_ part: HTTPClientRequestPart, flush: Bool) -> Bool {
-        guard let upstream else { return false }
+        guard let upstream else {
+            abandonRequestOnDeadUpstream()
+            return false
+        }
         guard upstream.write(part, flush: flush) else {
             abandonRequestOnDeadUpstream()
             return false
@@ -404,6 +434,13 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
     /// — NIO chuyển `isActive` và bắn `channelInactive` trong CÙNG một lệnh
     /// gọi đồng bộ `close0`, không nhường control giữa chừng (xem chú thích
     /// ở `UpstreamHandler.channelInactive`).
+    ///
+    /// GIỚI HẠN của lập luận đó: nó chỉ đúng cho lối vào "upstream đã chết".
+    /// Hàm này còn được gọi từ nhánh `upstream == nil` của `writeUpstream` —
+    /// nhánh hôm nay không đường nào chạm tới — và ở đó có thể chưa từng có
+    /// `UpstreamHandler` nào để đã báo cáo. Transaction vẫn không treo:
+    /// `channelInactive`/`handlerRemoved` của chính handler này rút hết
+    /// `state` và phát `.failed` cho mọi thứ còn chờ khi channel client đóng.
     ///
     /// `isUpstreamAborted = true` là phần bắt buộc, không phải cho gọn: chỉ
     /// nil hoá `upstream` thì phần body còn lại của CHÍNH request này rơi

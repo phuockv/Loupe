@@ -68,16 +68,28 @@ public final class AppModel {
 
     public func start() async {
         guard !isRunning else { return }
+        // Khai báo NGOÀI `do` để `catch` dọn được nó. `ProxyServer.init` cấp
+        // phát một `MultiThreadedEventLoopGroup(numberOfThreads:
+        // System.coreCount)` ngay trong init, và NIO KHÔNG dọn group khi
+        // deinit — thread của nó là detached và sống tiếp tới khi process
+        // chết. Đường thất bại hay gặp nhất là bind hỏng vì port đã bị chiếm,
+        // đúng lúc người dùng bấm "Chạy" lại ngay: không shutdown ở đây thì
+        // mỗi lần bấm rò rỉ `coreCount` thread vĩnh viễn.
+        var allocatedServer: ProxyServer?
         do {
             let authority = try CertificateAuthority.loadOrCreate(in: caDirectory)
             let cache = try LeafCertificateCache(authority: authority)
             let server = ProxyServer(configuration: configuration, leafCache: cache)
+            allocatedServer = server
             let port = try await server.start()
             consumeTask = store.consume(server.events)
             self.server = server
             isRunning = true
             statusMessage = "Đang nghe ở \(configuration.listenHost):\(port)"
         } catch {
+            // `nil` khi lỗi xảy ra TRƯỚC lúc dựng server (CA/leaf cache) —
+            // lúc đó chưa có group nào để dọn.
+            try? await allocatedServer?.shutdown()
             statusMessage = "Không khởi động được: \(error.localizedDescription)"
         }
     }

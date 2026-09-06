@@ -90,6 +90,32 @@ struct HeaderSanitizerTests {
         #expect(clean.first(name: "Connection") == nil)
     }
 
+    /// RFC 9110 cho phép `Connection` xuất hiện trên NHIỀU dòng field, và một
+    /// client/origin thật hoàn toàn có thể gửi như vậy. Đọc mỗi dòng ĐẦU
+    /// (`first(name:)`) thì mọi tên chỉ được nêu ở dòng sau được forward
+    /// nguyên — tức proxy chuyển tiếp đúng thứ RFC bảo nó phải tiêu thụ.
+    @Test("Connection trải trên NHIỀU dòng field: tên ở dòng sau cũng là hop-by-hop")
+    func connectionHeaderAcrossMultipleFieldLines() {
+        var headers = HTTPHeaders()
+        headers.add(name: "X-First", value: "1")
+        headers.add(name: "X-Second", value: "2")
+        headers.add(name: "X-Third", value: "3")
+        headers.add(name: "Connection", value: "X-First")
+        // Dòng thứ hai, và có cả dạng nhiều tên phân tách bằng dấu phẩy kèm
+        // khoảng trắng — cả hai phải cùng được xử lý.
+        headers.add(name: "Connection", value: "X-Second, X-Third")
+        headers.add(name: "Authorization", value: "Bearer abc")
+
+        let clean = HeaderSanitizer.sanitize(headers)
+        #expect(clean.first(name: "X-First") == nil)
+        #expect(clean.first(name: "X-Second") == nil,
+                "tên nêu ở dòng Connection THỨ HAI vẫn phải bị gỡ")
+        #expect(clean.first(name: "X-Third") == nil,
+                "tên sau dấu phẩy trên dòng Connection thứ hai vẫn phải bị gỡ")
+        #expect(clean.first(name: "Authorization") == "Bearer abc")
+        #expect(clean.first(name: "Connection") == nil)
+    }
+
     @Test("Port out of range in parseAbsoluteForm returns nil")
     func absoluteFormOutOfRangePort() {
         #expect(HeaderSanitizer.parseAbsoluteForm("http://example.com:99999") == nil)

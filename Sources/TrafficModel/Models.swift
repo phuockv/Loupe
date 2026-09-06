@@ -100,6 +100,20 @@ public struct Transaction: Identifiable, Sendable {
     /// Một transaction có thể vừa `isTunnelled` vừa `.completed`: tunnel đã chạy
     /// xong và đóng sạch, mà nội dung thì proxy chưa từng đọc được.
     public let isTunnelled: Bool
+    /// Byte THÔ đã relay qua tunnel, hai chiều: `bytesSent` là client → origin,
+    /// `bytesReceived` là origin → client.
+    ///
+    /// GIỚI HẠN, và nó là một phần của hợp đồng chứ không phải thiếu sót tạm
+    /// thời: CHỈ transaction `isTunnelled` mới được ghi hai trường này (xem
+    /// `TrafficEvent.bytesRelayed`). Với một transaction đã giải mã, kích
+    /// thước nằm ở `request.body`/`response.body` và hai trường này ở nguyên
+    /// 0 — đừng đọc chúng như "phiên này không chở byte nào".
+    ///
+    /// Con số đếm phần peer channel đã CHẤP NHẬN vào hàng đợi ghi, KHÔNG phải
+    /// phần chắc chắn đã ra tới dây: một lần đóng huỷ phần chưa flush vẫn có
+    /// thể vứt phần đuôi. Nó được cộng dồn SAU mỗi lần ghi được chấp nhận, nên
+    /// nó không bao giờ nói QUÁ những gì proxy đã chuyển đi được — với một
+    /// tunnel mù thì đây là con số duy nhất proxy biết chắc.
     public var bytesSent: Int
     public var bytesReceived: Int
 

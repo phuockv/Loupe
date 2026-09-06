@@ -75,13 +75,8 @@ public struct ContentView: View {
                 Text(transaction.duration.map { String(format: "%.0f ms", $0 * 1000) } ?? "—")
             }
             .width(min: 70, ideal: 80)
-            TableColumn("Size") { transaction in
-                Text(ByteCountFormatter.string(
-                    fromByteCount: Int64(transaction.response?.body.totalBytes ?? 0),
-                    countStyle: .file
-                ))
-            }
-            .width(min: 70, ideal: 80)
+            TableColumn("Size") { SizeCell(transaction: $0) }
+                .width(min: 70, ideal: 80)
         }
     }
 
@@ -228,5 +223,87 @@ struct StatusCell: View {
         case .failed(let reason):
             Text("thất bại").foregroundStyle(.orange).help(reason)
         }
+    }
+}
+
+/// Suy diễn thuần logic những gì cột Size hiển thị, tách khỏi SwiftUI để test
+/// được — cùng khuôn với `StatusPresentation`.
+///
+/// Kiểu này tồn tại vì một dòng: `response?.body.totalBytes ?? 0` chạy qua
+/// `ByteCountFormatter` in ra "Zero bytes" cho MỌI dòng CONNECT — cả tunnel mù
+/// đã relay 8 MB lẫn phiên MitM, vì response của cả hai là
+/// `200 Connection Established` tổng hợp với body `.none` — và cho cả một
+/// transaction `.failed` chết giữa body sau khi đã có `.responseHead`.
+/// "Zero bytes" là một KHẲNG ĐỊNH về dây; `.unknown` (hiện "—") là việc không
+/// đưa ra khẳng định nào.
+///
+/// Hệ quả CÓ CHỦ Ý: cột này không bao giờ in ra số 0. Một response rỗng thật
+/// (204/304) cũng hiện "—", vì model không phân biệt "origin không gửi body"
+/// với "ta chưa thu được body" — cả hai đều là `BodyPayload.none`. Nói ít hơn
+/// những gì mình biết là cái giá chấp nhận được; nói nhiều hơn thì không.
+struct SizePresentation: Equatable {
+    enum Kind: Equatable {
+        /// Không có con số nào ta biết chắc.
+        case unknown
+        /// Body đã thu TRỌN VẸN của một response đã giải mã.
+        case responseBody(bytes: Int)
+        /// Byte thô hai chiều của một tunnel mù — xem `Transaction.bytesSent`.
+        case relayedThroughTunnel(sent: Int, received: Int)
+    }
+
+    let kind: Kind
+
+    init(transaction: TrafficModel.Transaction) {
+        if transaction.isTunnelled {
+            // Tunnel mù không có "response body" nào để đo: đơn vị đo là cả
+            // phiên, và nó chỉ tồn tại sau khi tunnel đóng (`.bytesRelayed`).
+            //
+            // Tổng bằng 0 được coi là CHƯA BIẾT, và điều đó cố ý gộp hai
+            // trường hợp: tunnel đang chạy (byte đang chảy nhưng chưa ai báo)
+            // và tunnel thật sự chưa chở byte nào. Gộp về phía "chưa biết" là
+            // phía an toàn — phía kia in "Zero bytes" lên một tunnel đang tải
+            // dở, đúng lời nói dối cả kiểu này sinh ra để chặn.
+            let total = transaction.bytesSent + transaction.bytesReceived
+            kind = total > 0
+                ? .relayedThroughTunnel(sent: transaction.bytesSent,
+                                        received: transaction.bytesReceived)
+                : .unknown
+            return
+        }
+        guard let body = transaction.response?.body, body.totalBytes > 0 else {
+            kind = .unknown
+            return
+        }
+        // `.truncated` cũng vào đây: `totalBytes` của nó là con số THẬT trên
+        // dây, chỉ phần nội dung giữ lại mới bị cắt (xem `BodyPayload`).
+        kind = .responseBody(bytes: body.totalBytes)
+    }
+}
+
+/// Cột Size. Xem `SizePresentation` cho lý do "—" thay vì "Zero bytes".
+struct SizeCell: View {
+    let transaction: TrafficModel.Transaction
+
+    var body: some View {
+        switch SizePresentation(transaction: transaction).kind {
+        case .unknown:
+            Text("—").foregroundStyle(.secondary)
+        case .responseBody(let bytes):
+            Text(Self.formatted(bytes))
+        case .relayedThroughTunnel(let sent, let received):
+            // Con số ở đây là TỔNG hai chiều byte thô, không phải kích thước
+            // một response — tooltip nói rõ ra chứ không để người đọc tự suy.
+            Text(Self.formatted(sent + received))
+                .help("""
+                Tunnel mù: \(Self.formatted(sent)) client→origin \
+                + \(Self.formatted(received)) origin→client đã relay thô. \
+                Proxy không đọc được nội dung, và đây là phần peer đã nhận vào \
+                hàng đợi ghi — không hứa đã ra hết tới dây.
+                """)
+        }
+    }
+
+    private static func formatted(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 }

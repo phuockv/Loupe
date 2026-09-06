@@ -115,6 +115,14 @@ public final class TrafficStore {
             guard let position = index[id] else { return }
             transactions[position].request.body = payload
 
+        case .bytesRelayed(let id, let sent, let received):
+            guard let position = index[id] else { return }
+            // Gán chứ không cộng dồn: event này được phát ĐÚNG MỘT LẦN với
+            // tổng cuối cùng (xem `TunnelReporter.legClosed`), nên cộng dồn ở
+            // đây sẽ nhân đôi con số nếu event bị áp lại vì bất cứ lý do gì.
+            transactions[position].bytesSent = sent
+            transactions[position].bytesReceived = received
+
         case .completed(let id, let response, let endedAt):
             guard let position = index[id] else { return }
             transactions[position].response = response

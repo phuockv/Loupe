@@ -41,12 +41,13 @@ struct AppModelTests {
     /// `CertificateAuthority.defaultDirectory` thật, nếu không mỗi lần chạy
     /// test sẽ ghi CA xuống đúng Application Support của máy đang chạy nó.
     private func makeModel(
-        installer: FakeTrustStoreInstaller = FakeTrustStoreInstaller()
+        installer: FakeTrustStoreInstaller = FakeTrustStoreInstaller(),
+        listenPort: Int = 0
     ) -> AppModel {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppModelTests-\(UUID().uuidString)")
         var config = ProxyConfiguration()
-        config.listenPort = 0
+        config.listenPort = listenPort
         return AppModel(configuration: config, installer: installer, caDirectory: dir)
     }
 
@@ -81,6 +82,42 @@ struct AppModelTests {
 
         #expect(model.statusMessage == messageAfterFirstStart)
         await model.stop()
+    }
+
+    /// Bind hỏng vì port đã bị chiếm là đường thất bại HAY GẶP NHẤT của
+    /// `start()`, và cũng là đường người dùng bấm lại ngay lập tức. `catch`
+    /// của `start()` giờ có thêm một `await` (shutdown group của server vừa
+    /// cấp phát — không có nó thì mỗi lần bấm rò rỉ `coreCount` thread vĩnh
+    /// viễn, xem chú thích trong `start()`).
+    ///
+    /// GIỚI HẠN, nói thẳng: bài này KHÔNG chứng minh group đã được giải phóng
+    /// — số thread của process không quan sát được qua bề mặt của `AppModel`,
+    /// và bộ test chạy song song nên đếm thread cũng vô nghĩa. Nó chứng minh
+    /// phần CÒN LẠI quan sát được: lần start hỏng báo lỗi thay vì treo, không
+    /// bật `isRunning`, và lần bấm lại sau khi port được nhả vẫn chạy được.
+    @Test("start() thất bại vì port đã bị chiếm: báo lỗi, không treo, vẫn start lại được")
+    func failedStartIsReportedAndRecoverable() async {
+        let occupier = makeModel()
+        await occupier.start()
+        #expect(occupier.isRunning)
+        // Port thật đang nghe chỉ lộ ra qua statusMessage ("Đang nghe ở host:port").
+        guard let port = Int(occupier.statusMessage.split(separator: ":").last ?? "") else {
+            Issue.record("không đọc được port từ: \(occupier.statusMessage)")
+            await occupier.stop()
+            return
+        }
+
+        let blocked = makeModel(listenPort: port)
+        await blocked.start()
+        #expect(blocked.isRunning == false)
+        #expect(blocked.statusMessage.contains("Không khởi động được"),
+                "statusMessage: \(blocked.statusMessage)")
+
+        await occupier.stop()
+        await blocked.start()
+        #expect(blocked.isRunning,
+                "port đã được nhả thì lần bấm lại phải chạy được: \(blocked.statusMessage)")
+        await blocked.stop()
     }
 
     @Test("stop() khi chưa chạy là no-op, không crash")

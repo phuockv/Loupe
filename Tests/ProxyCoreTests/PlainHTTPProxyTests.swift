@@ -200,6 +200,36 @@ struct RawSequentialClientTimeoutError: Error, CustomStringConvertible {
     var description: String { "RawSequentialClient.send timed out waiting for a response" }
 }
 
+/// Cho mọi write outbound đi tiếp xuống dưới NHƯNG giữ lại promise của chúng,
+/// chưa hoàn tất cho tới khi test gọi `completeAll()`.
+///
+/// Dựng lại một trạng thái CÓ THẬT mà `HTTPProxyHandler.respond` phụ thuộc
+/// vào: send buffer phía client đang đầy, nên `writeAndFlush` chưa xong, nên
+/// `channel.close()` xếp trong completion của nó CHƯA chạy — trong khi decoder
+/// vẫn giao nốt `.body`/`.end` của CÙNG một lượt đọc. Trên `EmbeddedChannel`
+/// promise hoàn tất ngay lập tức, nên không có handler này thì channel đóng
+/// trước khi phần body kịp tới và nhánh cần kiểm không chạy được lần nào.
+final class StallingWriteHandler: ChannelOutboundHandler, @unchecked Sendable {
+    typealias OutboundIn = HTTPServerResponsePart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    private var stalled: [EventLoopPromise<Void>] = []
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        // Dữ liệu vẫn đi tiếp để `readOutbound` quan sát được; chỉ promise bị giữ.
+        if let promise { stalled.append(promise) }
+        context.write(data, promise: nil)
+    }
+
+    /// Nhả hết promise đang giữ. BẮT BUỘC gọi trước khi test kết thúc: NIO bắt
+    /// một `EventLoopPromise` chưa hoàn tất khi nó bị giải phóng.
+    func completeAll() {
+        let pending = stalled
+        stalled = []
+        for promise in pending { promise.succeed(()) }
+    }
+}
+
 /// Thu MỌI `TrafficEvent` mà proxy phát ra (không dừng ở event đầu tiên nào
 /// cả), và tuỳ chọn chạy một hành động đúng lúc `.started` đang được phát.
 ///
@@ -338,6 +368,17 @@ struct PlainHTTPProxyTests {
         }
         #expect(responseModel.statusCode == 200)
         #expect(responseModel.headers.contains { $0.name.lowercased() == "x-test" })
+
+        // Lời hứa NẶNG NHẤT của một công cụ bắt gói: body nó HIỆN đúng bằng
+        // byte đã đi trên dây. Khẳng định phía trên (và cả `data` mà client
+        // nhận được) chỉ chứng minh việc CHUYỂN TIẾP; nếu `UpstreamHandler`
+        // ngừng tích luỹ vào `BodyCollector` thì mọi thứ đó vẫn xanh trong
+        // khi bản GHI rỗng. Đây là chỗ duy nhất trong bộ test soi bản ghi đó.
+        guard case .inMemory(let recordedBody) = responseModel.body else {
+            Issue.record("body ghi lại phải là .inMemory, nhận: \(responseModel.body)")
+            return
+        }
+        #expect(String(decoding: recordedBody, as: UTF8.self) == "xin chao tu upstream")
     }
 
     @Test("Không nối được upstream thì trả 502 và transaction .failed")
@@ -794,5 +835,120 @@ struct PlainHTTPProxyTests {
             Issue.record("client phải nhận được 502"); return
         }
         #expect(response.status == .badGateway)
+    }
+
+    /// Request head KHÔNG phân giải được target (origin-form gửi tới cổng
+    /// plaintext của proxy) bị trả 400 — nhưng phần `.body`/`.end` của chính
+    /// nó vẫn đi tiếp trong cùng lượt đọc. Nếu head hỏng không đánh dấu
+    /// "request này đã bỏ dở", phần body đó tìm thấy `upstream` còn sót lại từ
+    /// một request TRƯỚC trên cùng kết nối keep-alive và được ghi thẳng vào
+    /// đó: một body không có head, tiêm vào một cuộc hội thoại đang sống với
+    /// origin thật.
+    @Test("Request head sai định dạng: body của nó không được tiêm vào upstream của request TRƯỚC")
+    func malformedHeadDoesNotInjectBodyIntoPreviousUpstream() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        let recorder = RecordingSink()
+        // `fixedTarget: nil` = đường plaintext, request BUỘC phải ở
+        // absolute-form; một URI origin-form tới đây là ca "không phân giải
+        // được target".
+        let handler = HTTPProxyHandler(configuration: ProxyConfiguration(),
+                                       sink: { recorder.record($0) }, fixedTarget: nil)
+        let client = EmbeddedChannel(handler: handler, loop: loop)
+        let stall = StallingWriteHandler()
+        try client.pipeline.syncOperations.addHandler(stall, position: .first)
+        client.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        defer { stall.completeAll(); client.close(promise: nil) }
+
+        // Kết nối keep-alive đã có sẵn upstream của một request TRƯỚC đó.
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let previousUpstream = EmbeddedChannel(loop: loop)
+        defer { previousUpstream.close(promise: nil) }
+        previousUpstream.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0),
+                                 promise: nil)
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: previousUpstream,
+                                                              target: target)
+
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1:8080")
+        headers.add(name: "Content-Length", value: "5")
+        try client.writeInbound(HTTPServerRequestPart.head(HTTPRequestHead(
+            version: .http1_1, method: .POST, uri: "/khong-phai-absolute-form",
+            headers: headers)))
+
+        guard case .head(let response)? = try client.readOutbound(as: HTTPServerResponsePart.self)
+        else {
+            Issue.record("proxy phải trả 400 cho request không ở absolute-form"); return
+        }
+        #expect(response.status == .badRequest)
+
+        try client.writeInbound(HTTPServerRequestPart.body(ByteBuffer(string: "hello")))
+        try client.writeInbound(HTTPServerRequestPart.end(nil))
+
+        #expect(try previousUpstream.readOutbound(as: HTTPClientRequestPart.self) == nil,
+                "body của một request không có head không được ghi vào upstream của request trước")
+        #expect(recorder.startedCount == 0, "request hỏng không mở transaction nào")
+    }
+
+    /// Bản GHI và bản CHUYỂN TIẾP của cùng một response head phải KHÁC nhau,
+    /// và khác đúng ở một chỗ: hop-by-hop chỉ được gỡ khỏi bản chuyển tiếp.
+    ///
+    /// Cả hai vế đều là lỗi thật nếu làm sai. Không gỡ khi forward thì
+    /// `Proxy-Authenticate` của origin hiện ra với client như thể CHÍNH PROXY
+    /// đang đòi xác thực. Gỡ luôn ở bản ghi thì công cụ hiện một response khác
+    /// với thứ origin đã gửi — đúng lớp lỗi cả module này tồn tại để chặn.
+    @Test("Response head: hop-by-hop bị gỡ khỏi bản CHUYỂN TIẾP, còn nguyên trong bản GHI")
+    func responseHopByHopStrippedOnForwardedCopyOnly() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        let config = ProxyConfiguration()
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let recorder = RecordingSink()
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: recorder, configuration: config, target: target)
+        defer { client.close(promise: nil) }
+
+        let upstream = EmbeddedChannel(
+            handler: UpstreamHandler(clientChannel: client, configuration: config,
+                                     sink: { recorder.record($0) }, state: handler.state),
+            loop: loop)
+        defer { upstream.close(promise: nil) }
+        upstream.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: upstream, target: target)
+
+        try client.writeInbound(HTTPServerRequestPart.head(requestHead(contentLength: nil)))
+
+        var originHeaders = HTTPHeaders()
+        originHeaders.add(name: "Content-Length", value: "0")
+        originHeaders.add(name: "X-Test", value: "1")
+        originHeaders.add(name: "Connection", value: "keep-alive")
+        originHeaders.add(name: "Keep-Alive", value: "timeout=5")
+        originHeaders.add(name: "Proxy-Authenticate", value: "Basic realm=\"origin\"")
+        try upstream.writeInbound(HTTPClientResponsePart.head(
+            HTTPResponseHead(version: .http1_1, status: .ok, headers: originHeaders)))
+        // `.end` chỉ để XẢ: `UpstreamHandler` ghi head với `flush: false`, mà
+        // `EmbeddedChannel.readOutbound` chỉ thấy phần đã flush.
+        try upstream.writeInbound(HTTPClientResponsePart.end(nil))
+
+        guard case .head(let forwarded)? = try client.readOutbound(as: HTTPServerResponsePart.self)
+        else {
+            Issue.record("client phải nhận được response head"); return
+        }
+        #expect(forwarded.headers.first(name: "Proxy-Authenticate") == nil)
+        #expect(forwarded.headers.first(name: "Connection") == nil)
+        #expect(forwarded.headers.first(name: "Keep-Alive") == nil)
+        #expect(forwarded.headers.first(name: "X-Test") == "1",
+                "header end-to-end phải qua nguyên vẹn")
+
+        let recordedHeads = recorder.events.compactMap { event -> ResponseModel? in
+            if case .responseHead(_, let model) = event { return model }
+            return nil
+        }
+        let recorded = try #require(recordedHeads.first,
+                                    "thiếu event .responseHead, events: \(recorder.events)")
+        #expect(recorded.headers.contains { $0.name.lowercased() == "proxy-authenticate" },
+                "bản GHI phải giữ header gốc của origin — đó chính là thứ người dùng đang soi")
+        #expect(recorded.headers.contains { $0.name.lowercased() == "connection" })
+        #expect(recorded.headers.contains { $0.name.lowercased() == "x-test" })
     }
 }

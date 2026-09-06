@@ -26,7 +26,26 @@ public struct ContentView: View {
             detailPane
         }
         .toolbar { toolbarContent(store: store, methodFilter: $store.methodFilter) }
-        .searchable(text: $store.searchText, prompt: "Lọc theo URL")
+        // `placement: .sidebar` thay vì mặc định (`.toolbar` trên
+        // NavigationSplitView): ô tìm kiếm chiếm chỗ đáng kể ngay cả khi thu
+        // gọn thành nút, và đó là một phần lý do toolbar chính hết chỗ cho
+        // nút Chạy/Dừng ở độ rộng cửa sổ mặc định — xem doc comment của
+        // `toolbarContent`.
+        .searchable(text: $store.searchText, placement: .sidebar, prompt: "Lọc theo URL")
+        // statusMessage nằm ở đây (thanh trạng thái đáy cửa sổ), KHÔNG phải
+        // trong toolbar — xem doc comment của `toolbarContent`: mục nó từng
+        // chiếm trong toolbar là lý do chính khiến nút Chạy/Dừng bị đẩy vào
+        // "more toolbar items" ở độ rộng cửa sổ mặc định. Ở đây nó luôn hiện
+        // trọn vẹn, không phụ thuộc chỗ trống của toolbar.
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Text(model.statusMessage).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar)
+        }
         // Refresh CA duy nhất lúc view xuất hiện — KHÔNG trong body/computed
         // property/timer, xem doc comment của `AppModel.refreshCertificateStatus()`.
         .task { await model.refreshCertificateStatus() }
@@ -36,11 +55,7 @@ public struct ContentView: View {
     private var detailPane: some View {
         if let id = model.selection,
            let transaction = model.store.transactions.first(where: { $0.id == id }) {
-            // Task 12 thay bằng InspectorView(transaction:) — placeholder này
-            // chỉ để build xanh, không phải UI cuối cùng.
-            Text(transaction.request.url.absoluteString)
-                .textSelection(.enabled)
-                .padding()
+            InspectorView(transaction: transaction)
         } else {
             ContentUnavailableView("Chọn một request", systemImage: "arrow.left.arrow.right")
         }
@@ -70,6 +85,19 @@ public struct ContentView: View {
         }
     }
 
+    // Task 12: ở độ rộng cửa sổ mặc định (1000pt, xem `minWidth` trong
+    // `App.swift`), toolbar cũ (Chạy/Dừng + Cài Root CA + badge trạng thái +
+    // nút refresh + Method picker + Xoá hết + status text, cộng thêm ô tìm
+    // kiếm và nút ẩn sidebar mà SwiftUI tự thêm) không đủ chỗ và macOS gói
+    // gần như TOÀN BỘ vào menu "more toolbar items" — xác nhận bằng
+    // Accessibility Inspector lúc chạy thật: chỉ còn "Hide Sidebar" và
+    // "Search" hiện trực tiếp, mọi thứ khác (kể cả nút Chạy) nằm sau một
+    // chevron ẩn. Ba thay đổi gộp lại mới đủ nhường chỗ cho nút Chạy/Dừng —
+    // điều khiển quan trọng nhất của app — hiện trực tiếp: gộp thao tác CA
+    // vào một `Menu` (một điều khiển thay vì ba), thu gọn "Xoá hết" về chỉ
+    // icon, và dời status message + ô tìm kiếm ra khỏi toolbar chính (xem
+    // `.safeAreaInset`/`.searchable` ở `body`) — hai thứ đó riêng rẽ vẫn
+    // không đủ, xem lịch sử đo ở test thủ công của task này.
     @ToolbarContentBuilder
     private func toolbarContent(store: TrafficStore, methodFilter: Binding<String?>) -> some ToolbarContent {
         ToolbarItem(placement: .navigation) {
@@ -84,9 +112,15 @@ public struct ContentView: View {
             }
         }
         ToolbarItem {
-            Button("Cài Root CA") { Task { await model.installCertificate() } }
+            Menu {
+                Button("Cài Root CA") { Task { await model.installCertificate() } }
+                Button("Kiểm tra lại trạng thái CA") {
+                    Task { await model.refreshCertificateStatus() }
+                }
+            } label: {
+                certificateStatusLabel
+            }
         }
-        ToolbarItem { certificateStatusView }
         ToolbarItem {
             Picker("Method", selection: methodFilter) {
                 Text("Tất cả").tag(String?.none)
@@ -95,32 +129,30 @@ public struct ContentView: View {
                 }
             }
         }
-        ToolbarItem { Button("Xoá hết") { store.clear() } }
-        ToolbarItem(placement: .status) {
-            Text(model.statusMessage).foregroundStyle(.secondary)
+        ToolbarItem {
+            Button {
+                store.clear()
+            } label: {
+                Label("Xoá hết", systemImage: "trash")
+            }
+            .labelStyle(.iconOnly)
+            .help("Xoá hết transaction đang hiện")
         }
     }
 
-    /// Hiện trạng thái CA đã kiểm tra lần gần nhất, kèm nút refresh THỦ CÔNG
-    /// — bấm mới gọi lại `isInstalled`, không có timer/computed property nào
-    /// tự gọi lại nó.
+    /// Hiện trạng CA đã kiểm tra lần gần nhất làm label cho menu thao tác CA.
+    /// Trạng thái chỉ được set bởi `refreshCertificateStatus()` — xem doc
+    /// comment của `AppModel.certificateInstalled` — nên không có gì ở đây
+    /// tự gọi lại nó ngoài hành động refresh trong menu.
     @ViewBuilder
-    private var certificateStatusView: some View {
-        HStack(spacing: 4) {
-            switch model.certificateInstalled {
-            case .some(true):
-                Label("CA đã cài", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
-            case .some(false):
-                Label("CA chưa cài", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            case .none:
-                Label("CA: chưa rõ", systemImage: "questionmark.circle").foregroundStyle(.secondary)
-            }
-            Button {
-                Task { await model.refreshCertificateStatus() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .help("Kiểm tra lại trạng thái Root CA")
+    private var certificateStatusLabel: some View {
+        switch model.certificateInstalled {
+        case .some(true):
+            Label("CA", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
+        case .some(false):
+            Label("CA", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .none:
+            Label("CA", systemImage: "questionmark.circle").foregroundStyle(.secondary)
         }
     }
 }

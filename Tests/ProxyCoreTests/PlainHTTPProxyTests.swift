@@ -951,4 +951,83 @@ struct PlainHTTPProxyTests {
         #expect(recorded.headers.contains { $0.name.lowercased() == "connection" })
         #expect(recorded.headers.contains { $0.name.lowercased() == "x-test" })
     }
+
+    /// Gương của test trên, ở chiều request.
+    ///
+    /// `rewriteAcceptEncoding` tồn tại vì hệ thống không giải nén được brotli,
+    /// nhưng nó THAY ĐỔI request đi trên dây. Nếu nó cũng sửa luôn bản ghi thì
+    /// công cụ sẽ khai rằng client gửi `gzip, deflate` trong khi client thật sự
+    /// gửi `gzip, deflate, br, zstd` — tức là nói dối về chính thứ người dùng
+    /// mở nó ra để xem.
+    @Test("Accept-Encoding bị viết lại ở bản CHUYỂN TIẾP, còn nguyên trong bản GHI")
+    func acceptEncodingRewrittenOnForwardedCopyOnly() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        var config = ProxyConfiguration()
+        config.rewriteAcceptEncoding = true
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let recorder = RecordingSink()
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: recorder, configuration: config, target: target)
+        defer { client.close(promise: nil) }
+
+        let upstream = EmbeddedChannel(loop: loop)
+        defer { upstream.close(promise: nil) }
+        upstream.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        try upstream.pipeline.syncOperations.addHTTPClientHandlers()
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: upstream, target: target)
+
+        let clientSent = "gzip, deflate, br, zstd"
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1:8080")
+        headers.add(name: "Accept-Encoding", value: clientSent)
+        try client.writeInbound(HTTPServerRequestPart.head(
+            HTTPRequestHead(version: .http1_1, method: .GET, uri: "/x", headers: headers)))
+        upstream.flush()
+
+        let wire = try upstream.readOutbound(as: ByteBuffer.self).map {
+            String(buffer: $0)
+        } ?? ""
+        #expect(wire.lowercased().contains("accept-encoding: gzip, deflate"),
+                "bản chuyển tiếp phải bị viết lại, wire: \(wire)")
+        #expect(!wire.lowercased().contains("br, zstd"),
+                "brotli/zstd phải biến mất khỏi bản chuyển tiếp")
+
+        let started = recorder.events.compactMap { event -> Transaction? in
+            if case .started(let transaction) = event { return transaction }
+            return nil
+        }
+        let recorded = try #require(started.first, "thiếu event .started")
+        #expect(recorded.request.headers.contains {
+            $0.name.lowercased() == "accept-encoding" && $0.value == clientSent
+        }, "bản GHI phải giữ đúng Accept-Encoding client gửi, không phải bản đã viết lại")
+    }
+
+    @Test("Tắt cờ thì Accept-Encoding đi qua nguyên vẹn")
+    func acceptEncodingUntouchedWhenFlagOff() throws {
+        let loop = EmbeddedEventLoop()
+        defer { loop.run() }
+        let config = ProxyConfiguration()   // mặc định: không viết lại
+        let target = HTTPProxyHandler.Target(host: "127.0.0.1", port: 8080, scheme: .http)
+        let (handler, client) = try makeEmbeddedProxy(
+            loop: loop, recorder: RecordingSink(), configuration: config, target: target)
+        defer { client.close(promise: nil) }
+
+        let upstream = EmbeddedChannel(loop: loop)
+        defer { upstream.close(promise: nil) }
+        upstream.connect(to: try SocketAddress(ipAddress: "127.0.0.1", port: 0), promise: nil)
+        try upstream.pipeline.syncOperations.addHTTPClientHandlers()
+        handler.upstream = HTTPProxyHandler.UpstreamConnection(channel: upstream, target: target)
+
+        var headers = HTTPHeaders()
+        headers.add(name: "Host", value: "127.0.0.1:8080")
+        headers.add(name: "Accept-Encoding", value: "gzip, deflate, br, zstd")
+        try client.writeInbound(HTTPServerRequestPart.head(
+            HTTPRequestHead(version: .http1_1, method: .GET, uri: "/x", headers: headers)))
+        upstream.flush()
+
+        let wire = try upstream.readOutbound(as: ByteBuffer.self).map { String(buffer: $0) } ?? ""
+        #expect(wire.lowercased().contains("br, zstd"),
+                "mặc định KHÔNG được đụng vào request của client, wire: \(wire)")
+    }
 }

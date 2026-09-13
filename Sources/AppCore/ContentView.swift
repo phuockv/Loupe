@@ -45,6 +45,16 @@ public struct ContentView: View {
                 // vừa được sửa cho vừa nút Chạy/Dừng ở độ rộng cửa sổ mặc định
                 // (xem doc comment của `toolbarContent`), thêm một mục nữa vào
                 // đó là đẩy nút Chạy về lại "more toolbar items".
+                Toggle("Ép server không nén", isOn: Binding(
+                    get: { model.forceDecompressible },
+                    set: { force in Task { await model.setForceDecompressible(force) } }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Viết lại Accept-Encoding thành \"gzip, deflate\" để server không trả brotli/zstd — "
+                    + "hệ thống không giải nén được hai loại đó. Lưu ý: việc này THAY ĐỔI request đi trên dây; "
+                    + "header ghi lại trong transaction vẫn là bản gốc client gửi.")
+
                 Toggle("Cho thiết bị LAN dùng", isOn: Binding(
                     get: { model.allowLANDevices },
                     set: { allow in Task { await model.setAllowLANDevices(allow) } }

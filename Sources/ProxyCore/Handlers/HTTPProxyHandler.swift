@@ -272,6 +272,14 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler {
         if forwarded.headers.first(name: "Host") == nil {
             forwarded.headers.add(name: "Host", value: hostHeader(for: target))
         }
+        // Chỉ đụng BẢN FORWARD. `makeTransaction` ở trên đã ghi `head.headers`
+        // nguyên bản vào transaction, nên UI vẫn hiện đúng Accept-Encoding mà
+        // client thật sự gửi — thay đổi này không được phép biến bản ghi thành
+        // lời khai sai về những gì client đã làm.
+        if configuration.rewriteAcceptEncoding,
+           forwarded.headers.first(name: "Accept-Encoding") != nil {
+            forwarded.headers.replaceOrAdd(name: "Accept-Encoding", value: "gzip, deflate")
+        }
         // Fixée thành `let` trước khi vào closure @Sendable bên dưới: capture
         // một `var` bị coi là tham chiếu có thể đổi đồng thời, dù thực tế nó
         // không còn bị sửa sau điểm này.

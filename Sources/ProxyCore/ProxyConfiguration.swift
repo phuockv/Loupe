@@ -25,6 +25,19 @@ public struct ProxyConfiguration: Sendable {
     /// đúng cho production.
     public var additionalTrustRoots: [NIOSSLCertificate] = []
 
+    /// Viết lại `Accept-Encoding` của request FORWARD thành `gzip, deflate`.
+    ///
+    /// Mặc định TẮT, có chủ ý. Trình duyệt gửi `gzip, deflate, br, zstd`, mà
+    /// `Compression` của hệ thống chỉ giải được gzip/deflate — nên response
+    /// brotli về tới nơi là không đọc được nội dung. Bật cờ này ép server
+    /// tránh brotli, đổi lại NÓ THAY ĐỔI THỨ ĐI TRÊN DÂY: bạn không còn quan
+    /// sát đúng request mà client thật sự gửi. Với một công cụ debug thì đó là
+    /// đánh đổi thật, nên nó phải là lựa chọn hiện rõ, không phải hành vi ngầm.
+    ///
+    /// Header GHI LẠI trong transaction luôn là bản gốc của client; chỉ bản
+    /// forward bị sửa — cùng kỷ luật với việc strip hop-by-hop.
+    public var rewriteAcceptEncoding: Bool = false
+
     public init(
         listenHost: String = "127.0.0.1",
         listenPort: Int = 9090,

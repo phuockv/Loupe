@@ -10,6 +10,12 @@ import TrafficModel
 /// tìm ra chỗ cùng một lớp lỗi (giấu mất `.failed`) còn sót lại ở đường
 /// không-tunnelled sau khi override 1 chỉ sửa đường tunnelled.
 public struct InspectorView: View {
+    /// Đọc một header không phân biệt hoa thường. Headers được lưu dạng mảng
+    /// cặp (HTTP cho phép lặp), nên không tra được bằng subscript.
+    static func header(_ name: String, in headers: [(name: String, value: String)]) -> String? {
+        headers.last { $0.name.lowercased() == name.lowercased() }?.value
+    }
+
     let transaction: TrafficModel.Transaction
     @State private var selectedTab: Tab = .request
 
@@ -67,7 +73,8 @@ public struct InspectorView: View {
                     KeyValueTable(pairs: transaction.request.headers)
                 }
                 InspectorSection("Body") {
-                    BodyView(payload: transaction.request.body)
+                    BodyView(payload: transaction.request.body,
+                             contentEncoding: Self.header("Content-Encoding", in: transaction.request.headers))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -96,7 +103,10 @@ public struct InspectorView: View {
                             partialResponseFailureNotice(reason)
                         }
                         InspectorSection("Headers") { KeyValueTable(pairs: response.headers) }
-                        InspectorSection("Body") { BodyView(payload: response.body) }
+                        InspectorSection("Body") {
+                            BodyView(payload: response.body,
+                                     contentEncoding: Self.header("Content-Encoding", in: response.headers))
+                        }
                     }
 
                 case .failed:
@@ -291,6 +301,9 @@ private struct KeyValueTable: View {
 /// im lặng ở đây khiến người xem tưởng nhầm phần đầu là tất cả.
 private struct BodyView: View {
     let payload: BodyPayload
+    /// Giá trị header `Content-Encoding` của chính phía này (request hoặc
+    /// response). `nil` nghĩa là không khai báo nén.
+    var contentEncoding: String? = nil
 
     var body: some View {
         switch payload {
@@ -330,8 +343,47 @@ private struct BodyView: View {
         }
     }
 
+    /// Giải nén trước khi quyết định hiển thị thế nào, và nói rõ đã giải nén.
     @ViewBuilder
     private func content(for data: Data) -> some View {
+        switch BodyDecoder.decode(data, contentEncoding: contentEncoding) {
+        case .identity(let raw):
+            rendered(raw)
+
+        case .decompressed(let out, let encoding, let wire, let truncated):
+            VStack(alignment: .leading, spacing: 6) {
+                Text(truncated
+                     ? "Đã giải nén từ \(encoding): \(bytes(wire)) trên dây → cắt ở \(bytes(out.count)) (quá lớn)"
+                     : "Đã giải nén từ \(encoding): \(bytes(wire)) trên dây → \(bytes(out.count))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                rendered(out)
+            }
+
+        case .unsupported(let encoding, let count):
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Body nén bằng \(encoding) (\(bytes(count))) — chưa giải nén được.")
+                    .foregroundStyle(.orange)
+                Text("Compression framework của hệ thống chỉ có gzip và deflate. "
+                     + "Bật \"Ép server không nén\" ở thanh dưới rồi gửi lại request để xem nội dung.")
+                    .font(.caption).foregroundStyle(.secondary)
+                hex(data)
+            }
+
+        case .failed(let encoding, let count):
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Khai báo \(encoding) nhưng giải nén thất bại (\(bytes(count))). "
+                     + "Body có thể hỏng, hoặc server khai sai.")
+                    .foregroundStyle(.orange)
+                hex(data)
+            }
+        }
+    }
+
+    /// Hiển thị dữ liệu đã ở dạng cuối: JSON → cây, text → nguyên văn,
+    /// còn lại → hex dump thay vì một câu từ chối.
+    @ViewBuilder
+    private func rendered(_ data: Data) -> some View {
         if let root = JSONNode.parse(data), let children = root.children, !children.isEmpty {
             OutlineGroup(children, children: \.children) { node in
                 HStack(alignment: .top, spacing: 8) {
@@ -343,10 +395,22 @@ private struct BodyView: View {
         } else if let text = String(data: data, encoding: .utf8) {
             Text(text).font(.system(.body, design: .monospaced))
         } else {
-            Text("\(byteCount(data.count)) dữ liệu nhị phân, không hiện được dạng text")
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(byteCount(data.count)) dữ liệu nhị phân")
+                    .font(.caption).foregroundStyle(.secondary)
+                hex(data)
+            }
         }
     }
+
+    @ViewBuilder
+    private func hex(_ data: Data) -> some View {
+        Text(BodyDecoder.hexDump(data))
+            .font(.system(.caption, design: .monospaced))
+            .textSelection(.enabled)
+    }
+
+    private func bytes(_ n: Int) -> String { byteCount(n) }
 
     private func byteCount(_ n: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)

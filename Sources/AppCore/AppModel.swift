@@ -38,6 +38,11 @@ public final class AppModel {
     /// proxy đang chạy, và bind chỉ đọc giá trị này lúc `start()`.
     public private(set) var allowLANDevices = false
 
+    /// Ép server không dùng brotli/zstd, bằng cách viết lại `Accept-Encoding`
+    /// của request forward. Xem `ProxyConfiguration.rewriteAcceptEncoding` —
+    /// nó THAY ĐỔI thứ đi trên dây, nên mặc định tắt.
+    public private(set) var forceDecompressible = false
+
     private var server: ProxyServer?
     private var consumeTask: Task<Void, Never>?
 
@@ -87,9 +92,9 @@ public final class AppModel {
     /// `internal` chứ không `private` để test khẳng định được host thật sự
     /// đem đi bind, thay vì chỉ khẳng định lại giá trị của toggle.
     var effectiveConfiguration: ProxyConfiguration {
-        guard allowLANDevices else { return configuration }
         var config = configuration
-        config.listenHost = "0.0.0.0"
+        if allowLANDevices { config.listenHost = "0.0.0.0" }
+        if forceDecompressible { config.rewriteAcceptEncoding = true }
         return config
     }
 
@@ -98,6 +103,19 @@ public final class AppModel {
     public func setAllowLANDevices(_ allow: Bool) async {
         guard allow != allowLANDevices else { return }
         allowLANDevices = allow
+        await restartIfRunning()
+    }
+
+    /// Bật/tắt việc ép server trả về dạng giải nén được.
+    public func setForceDecompressible(_ force: Bool) async {
+        guard force != forceDecompressible else { return }
+        forceDecompressible = force
+        await restartIfRunning()
+    }
+
+    /// Cả hai cờ trên chỉ được đọc lúc `start()`, nên đổi khi đang chạy thì
+    /// phải dựng lại server mới có hiệu lực.
+    private func restartIfRunning() async {
         guard isRunning else { return }
         await stop()
         await start()

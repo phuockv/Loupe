@@ -240,7 +240,7 @@ public final class AppModel {
             // không dùng vào đâu.
             _ = try CertificateAuthority.loadOrCreate(in: caDirectory)
             try await installer.install(pemPath: pemPath)
-            statusMessage = "Đã cài Root CA vào System keychain"
+            statusMessage = "Đã tin cậy Root CA cho tài khoản này"
         } catch TrustStoreError.cancelled {
             // Phân biệt rõ với thất bại thật: đây là người dùng chủ động bấm
             // Cancel ở hộp thoại xin quyền admin, không phải lỗi.

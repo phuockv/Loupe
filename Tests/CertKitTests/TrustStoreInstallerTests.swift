@@ -5,7 +5,7 @@ import Foundation
 @Suite("TrustStoreInstaller")
 struct TrustStoreInstallerTests {
 
-    @Test("install dựng đúng lệnh add-trusted-cert vào System keychain")
+    @Test("install cài vào USER domain — không -d, không System keychain")
     func buildsCorrectInstallCommand() async throws {
         let captured = CommandCapture()
         let installer = SecurityCommandInstaller(runner: captured.run)
@@ -13,8 +13,7 @@ struct TrustStoreInstallerTests {
 
         let arguments = await captured.arguments
         #expect(arguments == [
-            "/usr/bin/security", "add-trusted-cert", "-d", "-r", "trustRoot",
-            "-k", "/Library/Keychains/System.keychain", "/tmp/ca.pem",
+            "/usr/bin/security", "add-trusted-cert", "-r", "trustRoot", "/tmp/ca.pem",
         ])
     }
 
@@ -80,30 +79,6 @@ struct TrustStoreInstallerTests {
     }
 }
 
-@Suite("SecurityCommandInstaller.parseExitStatus")
-struct ParseExitStatusTests {
-
-    @Test("Rút đúng số exit code từ message lỗi kiểu 'The command exited with a non-zero status. (42)'")
-    func parsesOrdinaryExitCode() {
-        let status = SecurityCommandInstaller.parseExitStatus(
-            from: "0:25: execution error: The command exited with a non-zero status. (42)"
-        )
-        #expect(status == 42)
-    }
-
-    @Test("Rút đúng -128 khi người dùng bấm Cancel")
-    func parsesCancellationCode() {
-        let status = SecurityCommandInstaller.parseExitStatus(
-            from: "0:1: execution error: User canceled. (-128)"
-        )
-        #expect(status == -128)
-    }
-
-    @Test("Trả nil khi message không có dạng (<số>) ở cuối")
-    func returnsNilForUnrecognizedFormat() {
-        #expect(SecurityCommandInstaller.parseExitStatus(from: "không có ngoặc nào ở đây") == nil)
-    }
-}
 
 @Suite("TrustStoreError")
 struct TrustStoreErrorTests {
@@ -134,5 +109,33 @@ actor CommandCapture {
     func run(_ arguments: [String]) async throws -> String {
         self.arguments = arguments
         return ""
+    }
+
+    /// Khoá chặt hai cờ này, vì đúng chúng đã làm tính năng không chạy được.
+    ///
+    /// `-d` (admin store) buộc `SecTrustSettingsSetTrustSettings` phải xin
+    /// authorization qua hộp thoại trong phiên GUI — thứ một tiến trình root
+    /// sinh từ osascript không có. Kết quả là cert vào được keychain nhưng
+    /// KHÔNG BAO GIỜ được tin, và app báo "The authorization was denied since
+    /// no user interaction was possible". Ai thêm lại `-d` để "cài cho cả máy"
+    /// sẽ tái lập đúng lỗi đó.
+    @Test("install KHÔNG được dùng -d hay chỉ định System keychain")
+    func installNeverRequestsAdminDomain() async throws {
+        let captured = CommandCapture()
+        let installer = SecurityCommandInstaller(runner: captured.run)
+        try await installer.install(pemPath: URL(fileURLWithPath: "/tmp/ca.pem"))
+        let arguments = await captured.arguments
+        #expect(!arguments.contains("-d"), "-d đưa về admin store, không cài được từ app GUI")
+        #expect(!arguments.contains { $0.contains("System.keychain") })
+    }
+
+    @Test("Text huỷ được nhận ra; lỗi thật thì KHÔNG bị gán là người dùng huỷ")
+    func cancellationDetectionStaysNarrow() {
+        #expect(SecurityCommandInstaller.looksCancelled("SecKeychain: User canceled the operation"))
+        #expect(SecurityCommandInstaller.looksCancelled("errAuthorizationCanceled"))
+        #expect(!SecurityCommandInstaller.looksCancelled(
+            "SecTrustSettingsSetTrustSettings: The authorization was denied"),
+            "lỗi authorization KHÔNG phải người dùng huỷ — gán nhầm là đổ lỗi cho họ")
+        #expect(!SecurityCommandInstaller.looksCancelled("Error reading file"))
     }
 }

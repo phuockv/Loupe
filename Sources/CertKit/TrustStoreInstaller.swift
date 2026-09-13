@@ -95,93 +95,24 @@ public struct SecurityCommandInstaller: TrustStoreInstaller {
 
     public func install(pemPath: URL) async throws {
         _ = try await runner([
-            "/usr/bin/security", "add-trusted-cert", "-d", "-r", "trustRoot",
-            "-k", "/Library/Keychains/System.keychain", pemPath.path,
+            "/usr/bin/security", "add-trusted-cert", "-r", "trustRoot", pemPath.path,
         ])
     }
 
     // MARK: - Command execution
 
-    /// Rút số exit code thật từ message lỗi mà AppleScript đính kèm khi
-    /// `do shell script` thất bại — dạng "... (<n>)" ở cuối message, ví dụ
-    /// "The command exited with a non-zero status. (42)" hay
-    /// "User canceled. (-128)". `osascript` (tiến trình) luôn thoát 1 cho
-    /// MỌI lỗi kịch bản, nên exit code của chính nó không phân biệt được
-    /// nguyên nhân; số trong ngoặc mới là exit code thật của lệnh bên
-    /// trong, hoặc mã lỗi AppleScript (như -128 khi người dùng bấm Cancel).
-    /// Trả `nil` nếu message không theo đúng dạng đó.
-    static func parseExitStatus(from output: String) -> Int32? {
-        guard let openParen = output.lastIndex(of: "("),
-            let closeParen = output[openParen...].firstIndex(of: ")"),
-            openParen < closeParen
-        else { return nil }
-        return Int32(output[output.index(after: openParen)..<closeParen])
-    }
-
-    /// Script AppleScript cố định dùng cho lệnh cần quyền admin. KHÔNG bao
-    /// giờ nội suy nội dung của `arguments` vào đây — xem giải thích đầy đủ
-    /// ở `runProcess`.
-    private static let privilegedScript = """
-        on run argv
-            set cmd to ""
-            repeat with anArg in argv
-                if cmd is not "" then set cmd to cmd & " "
-                set cmd to cmd & quoted form of (anArg as text)
-            end repeat
-            do shell script cmd with administrator privileges
-        end run
-        """
-
-    /// Chạy `arguments` với quyền administrator qua `osascript`.
+    /// Người dùng bấm Cancel trên hộp thoại trust settings mà `securityd`
+    /// hiện ra.
     ///
-    /// Đường đi này có HAI lớp quoting chồng nhau — shell (bên trong
-    /// `do shell script`) và AppleScript string literal (nguồn kịch bản
-    /// truyền cho osascript) — nên tự tay escape một chuỗi bất kỳ để nội suy
-    /// an toàn vào CẢ HAI lớp cùng lúc là rất dễ sai (backslash, dấu nháy
-    /// đơn/kép, `$(...)`, newline đều là điểm rơi). Cách ở đây né hẳn việc
-    /// nội suy: script AppleScript (`privilegedScript`) là một literal CỐ
-    /// ĐỊNH, không bao giờ chứa nội dung của `arguments`. `arguments` được
-    /// truyền cho osascript như tham số dòng lệnh thật (qua mảng argument
-    /// của `Process`, tức `execve`, không qua `/bin/sh`), rồi bên trong
-    /// script, `argv` (từ `on run argv`) được duyệt và mỗi phần tử được đưa
-    /// qua `quoted form of` — hàm dựng sẵn của AppleScript chuyên escape một
-    /// chuỗi để dùng an toàn làm một "từ" trong dòng lệnh shell — trước khi
-    /// nối bằng dấu cách và chạy bằng
-    /// `do shell script ... with administrator privileges`. Đã kiểm tay
-    /// bằng osascript thật (không qua admin) với các input: dấu nháy
-    /// đơn/kép, backslash, `$(...)`, newline nhúng trong một argument, chuỗi
-    /// rỗng, và đường dẫn có khoảng trắng (như chính thư mục làm việc của
-    /// project này) — không lệnh nào bị inject, mọi argument đi qua nguyên
-    /// vẹn thành một token duy nhất.
-    ///
-    /// Đối số đầu tiên của `arguments` PHẢI là đường dẫn tuyệt đối (guard
-    /// bên dưới ép điều này): sau khi tiêu thụ cặp `-e privilegedScript`,
-    /// osascript tiếp tục parse các phần tử còn lại bằng chính flag-parser
-    /// của nó — một phần tử đúng bằng `"-e"` ở vị trí đó KHÔNG được xem là
-    /// dữ liệu cho script, mà bị hiểu là một lệnh `-e` thứ hai, nối thêm một
-    /// dòng AppleScript nữa vào script đang biên dịch. Đã kiểm tay: chạy
-    /// `osascript -e '<privilegedScript>' -e 'return "INJECTED"'` khiến
-    /// osascript biên dịch CẢ HAI làm một script (ở đây báo lỗi cú pháp vì
-    /// đụng hai `on run` handler, nhưng với script khác việc nối này có thể
-    /// biên dịch và chạy được — tức chạy AppleScript do "argument" quyết
-    /// định). Hai caller hiện tại luôn truyền `/usr/bin/security` làm phần
-    /// tử đầu nên không chạm vào đường này, nhưng đây là hàm `public`, nên
-    /// bất biến đó cần được CHÍNH HÀM ép, không phải chỉ dựa vào quy ước của
-    /// caller.
-    ///
-    /// Lưu ý: `do shell script` chuyển line ending trong text trả về từ LF
-    /// sang CR (hành vi đã biết của AppleScript, không phải lỗi ở đây). Hàm
-    /// này chuẩn hoá CR về LF trước khi trả về để caller parse theo dòng
-    /// không bị bất ngờ.
-    ///
-    /// Chạy trên một thread riêng (không phải cooperative pool của Swift
-    /// concurrency): `process.run()`/đọc pipe/`waitUntilExit()` chặn đồng bộ
-    /// cho tới khi người dùng đóng hộp thoại xin mật khẩu, có thể vô hạn
-    /// nếu họ bỏ đi — chặn một thread trong cooperative pool (rộng bằng số
-    /// core) sẽ làm cạn pool đó cho các Task khác, dù UI không đơ vì SwiftUI
-    /// không dùng thread đó.
-    public static let runProcess: CommandRunner = { arguments in
-        try await execute(arguments: arguments, privileged: true)
+    /// Nhận diện bằng text vì `security` trả cùng exit code cho mọi kiểu lỗi.
+    /// Chuỗi khớp được giữ HẸP có chủ ý: bắt rộng quá thì một lỗi thật sẽ bị
+    /// hiện thành "bạn đã huỷ", tức công cụ đổ lỗi cho người dùng về một việc
+    /// họ không làm.
+    static func looksCancelled(_ output: String) -> Bool {
+        let lower = output.lowercased()
+        return lower.contains("user canceled")
+            || lower.contains("user cancelled")
+            || lower.contains("errauthorizationcanceled")
     }
 
     /// Chạy `arguments` trực tiếp — không qua osascript, không cần quyền
@@ -189,10 +120,14 @@ public struct SecurityCommandInstaller: TrustStoreInstaller {
     /// `security verify-cert`, vốn không ghi vào keychain nên không cần
     /// quyền admin.
     public static let runProcessUnprivileged: CommandRunner = { arguments in
-        try await execute(arguments: arguments, privileged: false)
+        try await execute(arguments: arguments)
     }
 
-    private static func execute(arguments: [String], privileged: Bool) async throws -> String {
+    /// Tên cũ, giữ cho call site sẵn có. Giờ hai đường là một: không còn
+    /// đường nào chạy dưới quyền root.
+    public static let runProcess: CommandRunner = runProcessUnprivileged
+
+    private static func execute(arguments: [String]) async throws -> String {
         guard let first = arguments.first, first.hasPrefix("/") else {
             throw TrustStoreError.commandFailed(
                 status: -1,
@@ -201,13 +136,8 @@ public struct SecurityCommandInstaller: TrustStoreInstaller {
         }
 
         let process = Process()
-        if privileged {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", privilegedScript] + arguments
-        } else {
-            process.executableURL = URL(fileURLWithPath: first)
-            process.arguments = Array(arguments.dropFirst())
-        }
+        process.executableURL = URL(fileURLWithPath: first)
+        process.arguments = Array(arguments.dropFirst())
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -229,23 +159,14 @@ public struct SecurityCommandInstaller: TrustStoreInstaller {
                 let output = rawOutput.replacingOccurrences(of: "\r", with: "\n")
 
                 guard process.terminationStatus == 0 else {
-                    guard privileged else {
-                        // Không qua osascript: terminationStatus đã là exit
-                        // code thật, không cần rút số từ message.
-                        continuation.resume(
-                            throwing: TrustStoreError.commandFailed(
-                                status: process.terminationStatus, output: output
-                            )
-                        )
-                        return
-                    }
-                    let status = parseExitStatus(from: output) ?? process.terminationStatus
-                    if status == -128 {
+                    // Chạy trực tiếp nên terminationStatus ĐÃ là exit code
+                    // thật của `security`, không phải của một lớp bọc.
+                    if Self.looksCancelled(output) {
                         continuation.resume(throwing: TrustStoreError.cancelled)
                     } else {
                         continuation.resume(
-                            throwing: TrustStoreError.commandFailed(status: status, output: output)
-                        )
+                            throwing: TrustStoreError.commandFailed(
+                                status: process.terminationStatus, output: output))
                     }
                     return
                 }

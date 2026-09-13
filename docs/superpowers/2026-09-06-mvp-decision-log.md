@@ -166,3 +166,49 @@ không kiểm nội dung. Nó biến "code chạy quyền user" thành "code cà
 đúng một lần bấm admin — và hộp thoại xác thực hiện tên *osascript*, không phải tên certificate, nên người dùng
 không phát hiện được sự thay thế. Không chặn merge vì spec §10 đã hoãn signing/sandbox, nhưng **phải giải quyết
 trước khi phát hành**. Protocol `TrustStoreInstaller` tồn tại sẵn để thay bằng privileged helper.
+
+
+---
+
+## Cập nhật 2026-09-13 — PRE-RELEASE BLOCKER ĐÃ ĐÓNG
+
+Blocker ở trên (TOCTOU của trust-store installer) **không còn tồn tại**, và nó
+được đóng bằng cách xoá đi chứ không phải vá thêm.
+
+**Triệu chứng phát hiện ra vấn đề:** trên máy Mac thứ hai, nút "Cài Root CA" báo
+`SecTrustSettingsSetTrustSettings: The authorization was denied since no user
+interaction was possible.`
+
+**Nguyên nhân gốc — lỗi thiết kế trong spec §6.3 của tôi.** `security
+add-trusted-cert` làm hai việc: nhập cert vào keychain, rồi gọi
+`SecTrustSettingsSetTrustSettings` để đánh dấu được tin. Việc thứ hai cần một
+authorization mà `securityd` hỏi bằng hộp thoại **trong phiên GUI của người
+dùng**. Một tiến trình root sinh ra từ `osascript do shell script with
+administrator privileges` không có kết nối tới phiên đó.
+
+Nên đường admin **chưa bao giờ chạy được từ app GUI**, ở bất kỳ máy nào. Nó chỉ
+chạy khi gõ `sudo` trong Terminal. Trên máy đầu tiên nó "gần như chạy": cert vào
+được System keychain (nên `find-certificate` thấy), nhưng không bao giờ được tin
+(nên `verify-cert` trả `CSSMERR_TP_NOT_TRUSTED`). Chính bản sửa ở Task 9 — đổi
+`isInstalled` từ `find-certificate` sang `verify-cert` — là thứ khiến app nói
+đúng sự thật thay vì báo "đã cài".
+
+**Bản sửa:** bỏ cờ `-d`, cài vào **user domain** (mặc định của `security`).
+`securityd` hiện hộp thoại bình thường trong phiên người dùng, hỏi mật khẩu đăng
+nhập. Safari, Chrome, curl của tài khoản đó đều tin CA.
+
+**Hệ quả về bảo mật.** Toàn bộ cỗ máy chạy-dưới-root tồn tại chỉ để ghi vào
+System keychain. Bỏ yêu cầu đó thì xoá luôn được: `osascript`, script AppleScript
+cố định, hai tầng quoting, `parseExitStatus`, và cửa sổ TOCTOU giữa lúc
+`loadOrCreate` trả về và lúc root đọc file. `TrustStoreInstaller.swift` giảm từ
+256 xuống 177 dòng, và **không còn đường code nào chạy dưới quyền root**.
+
+**Đánh đổi, ghi rõ:** trust theo từng tài khoản thay vì toàn máy. Với một công cụ
+debug chạy trên tài khoản của chính người dùng thì phạm vi hẹp hơn là đúng hơn.
+Ai cần toàn máy thì tài liệu trong dmg ghi lệnh `sudo` chạy trong Terminal — nơi
+nó vốn chạy được.
+
+**Bài học lặp lại lần nữa:** cách viết cũ được cả một vòng security review đọc kỹ
+và khen là "well built" — quoting đúng, guard đúng, không chèn lệnh được. Nó
+đúng về mọi mặt trừ một: **nó không chạy được**. Không vòng review nào bắt được,
+vì không ai bấm nút thật. Chỉ có người dùng trên máy thứ hai bấm mới lộ ra.

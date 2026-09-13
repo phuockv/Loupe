@@ -38,9 +38,18 @@ Hoặc bằng terminal:
   xattr -dr com.apple.quarantine /Applications/ProxyManClone.app
 
 DÙNG
-1. Bấm "Cài Root CA" -> nhập mật khẩu admin.
+1. Bấm "Cài Root CA" -> macOS hỏi mật khẩu ĐĂNG NHẬP (không phải admin).
+   CA được tin cho RIÊNG tài khoản đang dùng, không phải cho cả máy —
+   đủ cho Safari, Chrome, curl của tài khoản đó, và không cần quyền root.
    CA được sinh RIÊNG trên từng máy. Máy mới sẽ có CA mới của chính nó;
    khoá riêng không bao giờ rời khỏi máy đã sinh ra nó.
+
+   Nếu cần tin cho CẢ MÁY (mọi tài khoản), chạy tay trong Terminal:
+     sudo security add-trusted-cert -d -r trustRoot \
+       -k /Library/Keychains/System.keychain \
+       ~/Library/Application\ Support/ProxyManClone/ca/ca.pem
+   Việc này KHÔNG làm được từ trong app: bước đánh dấu tin cậy cần một
+   hộp thoại trong phiên GUI, mà tiến trình root không có.
 2. Bấm "Chạy" -> proxy nghe ở 127.0.0.1:9090.
 3. Cho traffic đi qua:
      curl -x 127.0.0.1:9090 https://example.com/
@@ -53,7 +62,7 @@ DÙNG
 
 GỠ
 - Xoá app.
-- Keychain Access -> System -> xoá "ProxyManClone Root CA".
+- Keychain Access -> login -> xoá "ProxyManClone Root CA".
   App chưa có nút gỡ CA; phải làm tay.
 - rm -rf ~/Library/Application\ Support/ProxyManClone
 

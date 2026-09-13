@@ -136,7 +136,11 @@ struct AppModelTests {
 
         await model.installCertificate()
 
-        #expect(model.statusMessage.contains("Đã cài"))
+        // Khẳng định cả PHẠM VI, không chỉ "thành công": CA được tin cho
+        // riêng tài khoản này chứ không phải cả máy, và người dùng cần biết
+        // điều đó — nói "đã cài" trống không là để họ tự suy diễn sai.
+        #expect(model.statusMessage.contains("tài khoản này"),
+                "status: \(model.statusMessage)")
         #expect(model.certificateInstalled == true)
         #expect(await installer.installCallCount == 1)
     }

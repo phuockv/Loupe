@@ -299,11 +299,25 @@ private struct KeyValueTable: View {
 /// dung file vào view: làm vậy dựng lại đúng vấn đề RAM mà việc spill ra đĩa
 /// sinh ra để tránh. `.truncated` phải nói rõ đây không phải toàn bộ body —
 /// im lặng ở đây khiến người xem tưởng nhầm phần đầu là tất cả.
+/// Cách hiển thị một body đọc được.
+enum BodyDisplayMode: String, CaseIterable, Identifiable {
+    /// JSON in đẹp — mặc định khi body là JSON, vì mở response ra là để ĐỌC.
+    case json = "JSON"
+    /// Đúng byte nhận được, không sắp xếp lại gì. Cần khi thứ tự khoá quan
+    /// trọng, hoặc khi body không phải JSON.
+    case raw = "Thô"
+    /// Cây thu gọn — hữu ích với cấu trúc lớn, vô dụng làm mặc định.
+    case tree = "Cây"
+    var id: String { rawValue }
+}
+
 private struct BodyView: View {
     let payload: BodyPayload
     /// Giá trị header `Content-Encoding` của chính phía này (request hoặc
     /// response). `nil` nghĩa là không khai báo nén.
     var contentEncoding: String? = nil
+
+    @State private var mode: BodyDisplayMode?
 
     var body: some View {
         switch payload {
@@ -384,16 +398,47 @@ private struct BodyView: View {
     /// còn lại → hex dump thay vì một câu từ chối.
     @ViewBuilder
     private func rendered(_ data: Data) -> some View {
-        if let root = JSONNode.parse(data), let children = root.children, !children.isEmpty {
-            OutlineGroup(children, children: \.children) { node in
-                HStack(alignment: .top, spacing: 8) {
-                    Text(node.key).bold()
-                    Text(node.value).foregroundStyle(.secondary)
+        let pretty = JSONNode.prettyPrinted(data)
+        let text = String(data: data, encoding: .utf8)
+        // Mặc định: JSON in đẹp nếu parse được, không thì văn bản thô. Cây
+        // KHÔNG bao giờ là mặc định — thu gọn hết thì nó không cho biết gì.
+        let current = mode ?? (pretty != nil ? .json : .raw)
+
+        if pretty != nil || text != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                if pretty != nil {
+                    Picker("", selection: Binding(
+                        get: { current }, set: { mode = $0 })) {
+                        ForEach(BodyDisplayMode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
                 }
-                .font(.system(.body, design: .monospaced))
+
+                switch current {
+                case .json:
+                    Text(pretty ?? text ?? "")
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                case .raw:
+                    Text(text ?? "")
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                case .tree:
+                    if let children = JSONNode.parse(data)?.children, !children.isEmpty {
+                        OutlineGroup(children, children: \.children) { node in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(node.key).bold()
+                                Text(node.value).foregroundStyle(.secondary)
+                            }
+                            .font(.system(.body, design: .monospaced))
+                        }
+                    } else {
+                        Text(text ?? "").font(.system(.body, design: .monospaced))
+                    }
+                }
             }
-        } else if let text = String(data: data, encoding: .utf8) {
-            Text(text).font(.system(.body, design: .monospaced))
         } else {
             VStack(alignment: .leading, spacing: 6) {
                 Text("\(byteCount(data.count)) dữ liệu nhị phân")

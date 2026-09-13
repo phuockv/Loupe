@@ -58,3 +58,42 @@ struct JSONNodeTests {
         #expect(root.children?.first?.value == "null")
     }
 }
+
+@Suite("JSON in đẹp")
+struct JSONPrettyPrintTests {
+
+    @Test("Object nhỏ gọn thành nhiều dòng có thụt lề")
+    func expandsCompactObject() throws {
+        let pretty = try #require(JSONNode.prettyPrinted(Data(#"{"a":1,"b":2}"#.utf8)))
+        #expect(pretty.contains("\n"), "phải xuống dòng, không còn một dòng dính liền")
+        #expect(pretty.contains("  "), "phải có thụt lề")
+        #expect(pretty.contains("\"a\" : 1") || pretty.contains("\"a\": 1"))
+    }
+
+    @Test("Mảng lồng nhau in ra được, không mất phần tử")
+    func keepsEveryElement() throws {
+        let json = #"[{"id":1},{"id":2},{"id":3}]"#
+        let pretty = try #require(JSONNode.prettyPrinted(Data(json.utf8)))
+        for id in ["1", "2", "3"] { #expect(pretty.contains(id)) }
+    }
+
+    @Test("Không escape dấu gạch chéo trong URL — /api/v1 chứ không \\/api\\/v1")
+    func doesNotEscapeSlashes() throws {
+        let pretty = try #require(JSONNode.prettyPrinted(Data(#"{"u":"/api/v1"}"#.utf8)))
+        #expect(pretty.contains("/api/v1"))
+        #expect(!pretty.contains("\\/"))
+    }
+
+    @Test("Không phải JSON thì trả nil để view rơi về chế độ Thô")
+    func returnsNilForNonJSON() {
+        #expect(JSONNode.prettyPrinted(Data("<html></html>".utf8)) == nil)
+    }
+
+    @Test("Giữ nguyên giá trị boolean, không biến thành 1/0")
+    func keepsBooleansAsBooleans() throws {
+        let pretty = try #require(JSONNode.prettyPrinted(Data(#"{"ok":true,"no":false}"#.utf8)))
+        #expect(pretty.contains("true"))
+        #expect(pretty.contains("false"))
+        #expect(!pretty.contains(": 1"))
+    }
+}

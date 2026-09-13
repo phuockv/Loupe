@@ -11,6 +11,21 @@ public struct JSONNode: Identifiable, Sendable {
     public let value: String
     public let children: [JSONNode]?
 
+    /// JSON in đẹp, để đọc thẳng. `nil` nếu không phải JSON.
+    ///
+    /// `JSONSerialization` không giữ thứ tự khoá gốc, nên bản in ra có thể
+    /// khác thứ tự trên dây. Ai cần đúng thứ tự gốc thì xem chế độ "Thô" —
+    /// đó là lý do chế độ đó tồn tại thay vì bị coi là thừa.
+    public static func prettyPrinted(_ data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(
+            with: data, options: [.fragmentsAllowed]),
+            let pretty = try? JSONSerialization.data(
+                withJSONObject: object,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        else { return nil }
+        return String(data: pretty, encoding: .utf8)
+    }
+
     public static func parse(_ data: Data) -> JSONNode? {
         guard let object = try? JSONSerialization.jsonObject(
             with: data, options: [.fragmentsAllowed]

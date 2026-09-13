@@ -73,14 +73,23 @@ public struct ContentView: View {
         .task { await model.refreshCertificateStatus() }
     }
 
-    @ViewBuilder
     private var detailPane: some View {
-        if let id = model.selection,
-           let transaction = model.store.transactions.first(where: { $0.id == id }) {
-            InspectorView(transaction: transaction)
-        } else {
-            ContentUnavailableView("Chọn một request", systemImage: "arrow.left.arrow.right")
+        // `frame` ở ĐÂY, ngoài cả hai nhánh: nếu không, bề ngang mà pane này
+        // đòi phụ thuộc nội dung của dòng đang chọn (một URL dài đòi khác một
+        // URL ngắn, `ContentUnavailableView` đòi khác cả hai) và
+        // NavigationSplitView đáp ứng bằng cách dời đường chia mỗi lần đổi
+        // dòng — cùng gốc với việc cho Text tự do đòi bề ngang, xem
+        // `KeyValueTable` ở `InspectorView.swift`. Một `minWidth` cố định
+        // biến bề ngang thành thuộc tính của cửa sổ, không phải của dòng.
+        Group {
+            if let id = model.selection,
+               let transaction = model.store.transactions.first(where: { $0.id == id }) {
+                InspectorView(transaction: transaction)
+            } else {
+                ContentUnavailableView("Chọn một request", systemImage: "arrow.left.arrow.right")
+            }
         }
+        .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private func transactionTable(transactions: [TrafficModel.Transaction]) -> some View {

@@ -58,9 +58,14 @@ public struct InspectorView: View {
     private var requestTab: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                LabeledContent("URL", value: transaction.request.url.absoluteString)
-                LabeledContent("Method", value: transaction.request.method)
-                LabeledContent("HTTP", value: transaction.request.httpVersion)
+                // Dùng chung khuôn với KeyValueTable thay vì LabeledContent:
+                // LabeledContent cố nhồi value lên một dòng, nên một URL dài
+                // đẩy cả pane rộng ra.
+                KeyValueTable(pairs: [
+                    (name: "URL", value: transaction.request.url.absoluteString),
+                    (name: "Method", value: transaction.request.method),
+                    (name: "HTTP", value: transaction.request.httpVersion),
+                ])
 
                 if !transaction.request.queryItems.isEmpty {
                     InspectorSection("Query Parameters") {
@@ -81,6 +86,11 @@ public struct InspectorView: View {
             .padding(.vertical, 8)
             .textSelection(.enabled)
         }
+        // Đổi transaction = ScrollView mới. Không có `.id` này, SwiftUI tái
+        // dùng ScrollView cũ kèm offset cũ; dòng mới thường cao khác dòng cũ
+        // nên offset đó không hợp lệ và nội dung bị giật về vị trí khác ngay
+        // sau khi vẽ.
+        .id(transaction.id)
     }
 
     @ViewBuilder
@@ -98,7 +108,9 @@ public struct InspectorView: View {
 
                 case .response(let statusCode, let reasonPhrase):
                     if let response = transaction.response {
-                        LabeledContent("Status", value: "\(statusCode) \(reasonPhrase)")
+                        KeyValueTable(pairs: [
+                            (name: "Status", value: "\(statusCode) \(reasonPhrase)"),
+                        ])
                         if let reason = presentation.failureReason {
                             partialResponseFailureNotice(reason)
                         }
@@ -124,6 +136,7 @@ public struct InspectorView: View {
             .padding(.vertical, 8)
             .textSelection(.enabled)
         }
+        .id(transaction.id)
     }
 
     /// Host nằm trong bypass list: PHẢI nói rõ ngay, không đợi người dùng tự
@@ -192,6 +205,8 @@ public struct InspectorView: View {
     private func failureReasonText(_ reason: String) -> some View {
         Text(reason)
             .font(.system(.body, design: .monospaced))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -285,7 +300,16 @@ private struct KeyValueTable: View {
                 ForEach(Array(pairs.enumerated()), id: \.offset) { _, pair in
                     HStack(alignment: .top) {
                         Text(pair.name).bold().frame(width: 180, alignment: .leading)
+                        // `fixedSize(horizontal: false, vertical: true)` là mấu
+                        // chốt: không có nó, một giá trị dài không có chỗ ngắt
+                        // (token Authorization, URL có query) sẽ ĐÒI thêm bề
+                        // ngang thay vì xuống dòng. NavigationSplitView đáp ứng
+                        // bằng cách co sidebar lại — và vì mỗi dòng có độ dài
+                        // khác nhau, đường chia nhảy mỗi lần đổi dòng. Đó chính
+                        // là cái "lắc".
                         Text(pair.value)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .font(.system(.body, design: .monospaced))
                 }
@@ -338,6 +362,8 @@ private struct BodyView: View {
                 .foregroundStyle(.secondary)
                 Text(url.path)
                     .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
         case .truncated(let data, let total):
@@ -421,16 +447,23 @@ private struct BodyView: View {
                     Text(pretty ?? text ?? "")
                         .font(.system(.body, design: .monospaced))
                         .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                 case .raw:
                     Text(text ?? "")
                         .font(.system(.body, design: .monospaced))
                         .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
                 case .tree:
                     if let children = JSONNode.parse(data)?.children, !children.isEmpty {
                         OutlineGroup(children, children: \.children) { node in
                             HStack(alignment: .top, spacing: 8) {
                                 Text(node.key).bold()
-                                Text(node.value).foregroundStyle(.secondary)
+                                Text(node.value)
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                             .font(.system(.body, design: .monospaced))
                         }
@@ -453,6 +486,8 @@ private struct BodyView: View {
         Text(BodyDecoder.hexDump(data))
             .font(.system(.caption, design: .monospaced))
             .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func bytes(_ n: Int) -> String { byteCount(n) }

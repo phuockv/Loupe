@@ -150,7 +150,9 @@ public final class AppModel {
             guard getnameinfo(address, socklen_t(address.pointee.sa_len),
                               &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
             else { continue }
-            let text = String(cString: host)
+            // Cắt ở NUL rồi decode: String(cString:) đã deprecated.
+            let text = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+                              as: UTF8.self)
             if !text.isEmpty { return text }
         }
         return nil

@@ -25,6 +25,19 @@ public final class AppModel {
     /// SwiftUI nghĩa là gọi lại nó mỗi lần render.
     public private(set) var certificateInstalled: Bool?
 
+    /// Bind `0.0.0.0` thay vì `127.0.0.1`, để thiết bị khác trong LAN (iPhone,
+    /// máy ảo) dùng được proxy này.
+    ///
+    /// Mặc định TẮT, có chủ ý. Bind mọi interface biến proxy thành một open
+    /// proxy trên mạng: bất kỳ ai cùng Wi-Fi đều định tuyến traffic của họ qua
+    /// máy này được, và log ở đây sẽ lẫn traffic lạ. Ở mạng nhà rủi ro thấp; ở
+    /// quán cà phê hay mạng công ty thì không. Người dùng bật khi cần bắt
+    /// traffic thiết bị khác, tắt khi xong.
+    ///
+    /// Chỉ đổi qua `setAllowLANDevices(_:)` — đổi thẳng sẽ không restart
+    /// proxy đang chạy, và bind chỉ đọc giá trị này lúc `start()`.
+    public private(set) var allowLANDevices = false
+
     private var server: ProxyServer?
     private var consumeTask: Task<Void, Never>?
 
@@ -66,6 +79,65 @@ public final class AppModel {
         caDirectory.appendingPathComponent("ca.pem")
     }
 
+    /// Cấu hình thật sự đem đi bind.
+    ///
+    /// Chỉ ghi đè `listenHost` khi toggle BẬT — để một `ProxyConfiguration`
+    /// được tiêm vào (test dùng cổng 0, host tuỳ ý) không bị âm thầm mất host
+    /// của nó ở trạng thái mặc định.
+    /// `internal` chứ không `private` để test khẳng định được host thật sự
+    /// đem đi bind, thay vì chỉ khẳng định lại giá trị của toggle.
+    var effectiveConfiguration: ProxyConfiguration {
+        guard allowLANDevices else { return configuration }
+        var config = configuration
+        config.listenHost = "0.0.0.0"
+        return config
+    }
+
+    /// Bật/tắt việc cho thiết bị khác trong LAN dùng proxy. Nếu proxy đang
+    /// chạy thì restart, vì host bind chỉ được đọc một lần lúc `start()`.
+    public func setAllowLANDevices(_ allow: Bool) async {
+        guard allow != allowLANDevices else { return }
+        allowLANDevices = allow
+        guard isRunning else { return }
+        await stop()
+        await start()
+    }
+
+    /// Văn bản trạng thái sau khi bind thành công.
+    ///
+    /// Tách khỏi `start()` để test được mà không cần dựng server thật. Khi
+    /// bind `0.0.0.0`, hiện IP LAN chứ không hiện `0.0.0.0` — người dùng cần
+    /// một con số gõ được vào phần cấu hình proxy của iPhone, và `0.0.0.0`
+    /// không phải con số đó.
+    static func listeningStatus(host: String, port: Int, lanAddress: String?) -> String {
+        guard host == "0.0.0.0" else { return "Đang nghe ở \(host):\(port)" }
+        guard let lanAddress else {
+            return "Đang nghe ở mọi interface, cổng \(port) — chưa tìm thấy IP LAN của máy"
+        }
+        return "Đang nghe ở \(lanAddress):\(port) — thiết bị khác trong LAN dùng được"
+    }
+
+    /// IPv4 đầu tiên của một interface đang UP và không phải loopback.
+    /// `nil` khi không có (chưa nối mạng).
+    static func localNetworkAddress() -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(entry.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            guard let address = entry.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len),
+                              &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0
+            else { continue }
+            let text = String(cString: host)
+            if !text.isEmpty { return text }
+        }
+        return nil
+    }
+
     public func start() async {
         guard !isRunning else { return }
         // Khai báo NGOÀI `do` để `catch` dọn được nó. `ProxyServer.init` cấp
@@ -79,13 +151,18 @@ public final class AppModel {
         do {
             let authority = try CertificateAuthority.loadOrCreate(in: caDirectory)
             let cache = try LeafCertificateCache(authority: authority)
-            let server = ProxyServer(configuration: configuration, leafCache: cache)
+            let config = effectiveConfiguration
+            let server = ProxyServer(configuration: config, leafCache: cache)
             allocatedServer = server
             let port = try await server.start()
             consumeTask = store.consume(server.events)
             self.server = server
             isRunning = true
-            statusMessage = "Đang nghe ở \(configuration.listenHost):\(port)"
+            statusMessage = Self.listeningStatus(
+                host: config.listenHost,
+                port: port,
+                lanAddress: config.listenHost == "0.0.0.0" ? Self.localNetworkAddress() : nil
+            )
         } catch {
             // `nil` khi lỗi xảy ra TRƯỚC lúc dựng server (CA/leaf cache) —
             // lúc đó chưa có group nào để dọn.

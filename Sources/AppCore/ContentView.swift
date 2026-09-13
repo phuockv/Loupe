@@ -41,6 +41,18 @@ public struct ContentView: View {
             HStack {
                 Text(model.statusMessage).foregroundStyle(.secondary)
                 Spacer()
+                // Toggle nằm ở thanh trạng thái chứ KHÔNG phải toolbar: toolbar
+                // vừa được sửa cho vừa nút Chạy/Dừng ở độ rộng cửa sổ mặc định
+                // (xem doc comment của `toolbarContent`), thêm một mục nữa vào
+                // đó là đẩy nút Chạy về lại "more toolbar items".
+                Toggle("Cho thiết bị LAN dùng", isOn: Binding(
+                    get: { model.allowLANDevices },
+                    set: { allow in Task { await model.setAllowLANDevices(allow) } }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Bind 0.0.0.0 để iPhone hoặc máy khác cùng Wi-Fi dùng được proxy. "
+                    + "Bật lên là bất kỳ ai trong mạng cũng đi qua được — tắt khi xong.")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)

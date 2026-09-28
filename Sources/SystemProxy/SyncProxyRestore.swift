@@ -16,8 +16,15 @@ public enum SyncProxyRestore {
     @discardableResult
     public static func restoreNow(
         storeURL: URL,
-        runSync: SyncRunner = { NetworkSetupConfigurer.runProcessSync($0) }
+        runSync: SyncRunner? = nil
     ) -> Bool {
+        // `runSync` mặc định `nil` — một literal, không tham chiếu gì cả —
+        // để giữ `NetworkSetupConfigurer.runProcessSync` là internal. Tham
+        // chiếu nó ngay trong biểu thức mặc định của một khai báo public sẽ
+        // buộc nó phải public theo cùng mức, dù chẳng có nơi gọi nào bên
+        // ngoài module cần tới nó.
+        let run = runSync ?? { NetworkSetupConfigurer.runProcessSync($0) }
+
         let store = ProxySnapshotStore(url: storeURL)
         // `try?` trên một biểu thức kiểu `ProxySnapshot?` được Swift làm
         // phẳng thành `ProxySnapshot?`, nên một lần `let` là đủ.
@@ -29,7 +36,7 @@ public enum SyncProxyRestore {
         for original in snapshot.services {
             // Cùng luật với đường async: chỉ đụng dịch vụ còn trỏ vào ta.
             guard case .success(let webOut) =
-                    runSync([binary, "-getwebproxy", original.service]),
+                    run([binary, "-getwebproxy", original.service]),
                   let currentWeb = try? NetworkSetupConfigurer.parseProxy(webOut)
             else { allSucceeded = false; continue }
 
@@ -46,7 +53,7 @@ public enum SyncProxyRestore {
                        [binary, stateCmd, original.service, "on"]]
                     : [[binary, stateCmd, original.service, "off"]]
                 for command in commands {
-                    if case .failure = runSync(command) { allSucceeded = false }
+                    if case .failure = run(command) { allSucceeded = false }
                 }
             }
         }

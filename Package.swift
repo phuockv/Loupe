@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "TrafficModel", targets: ["TrafficModel"]),
         .library(name: "CertKit", targets: ["CertKit"]),
+        .library(name: "SystemProxy", targets: ["SystemProxy"]),
         .library(name: "ProxyCore", targets: ["ProxyCore"]),
         .executable(name: "ProxyManCloneApp", targets: ["ProxyManCloneApp"]),
     ],
@@ -26,6 +27,7 @@ let package = Package(
             .product(name: "Crypto", package: "swift-crypto"),
             .product(name: "SwiftASN1", package: "swift-asn1"),
         ]),
+        .target(name: "SystemProxy"),
         .target(name: "ProxyCore", dependencies: [
             "TrafficModel", "CertKit",
             .product(name: "NIOCore", package: "swift-nio"),
@@ -58,5 +60,6 @@ let package = Package(
             .product(name: "NIOHTTP1", package: "swift-nio"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
         ]),
+        .testTarget(name: "SystemProxyTests", dependencies: ["SystemProxy"]),
     ]
 )

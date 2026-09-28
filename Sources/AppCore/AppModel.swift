@@ -55,7 +55,7 @@ public final class AppModel {
     private var server: ProxyServer?
     private var consumeTask: Task<Void, Never>?
     private var listeningPort: Int?
-    private let systemProxy = SystemProxyController()
+    private let systemProxy: SystemProxyController
 
     /// Task thật sự chạy `installer.install(pemPath:)`, sở hữu bởi AppModel
     /// chứ không phải bởi view gọi `installCertificate()`.
@@ -83,12 +83,14 @@ public final class AppModel {
         configuration: ProxyConfiguration = ProxyConfiguration(),
         installer: any TrustStoreInstaller = SecurityCommandInstaller(),
         store: TrafficStore = TrafficStore(),
-        caDirectory: URL = CertificateAuthority.defaultDirectory
+        caDirectory: URL = CertificateAuthority.defaultDirectory,
+        systemProxy: SystemProxyController = SystemProxyController()
     ) {
         self.configuration = configuration
         self.installer = installer
         self.store = store
         self.caDirectory = caDirectory
+        self.systemProxy = systemProxy
     }
 
     private var pemPath: URL {

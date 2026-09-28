@@ -9,21 +9,49 @@ import SystemProxy
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var signalSources: [DispatchSourceSignal] = []
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        // Việc đầu tiên, trước khi làm gì khác: file snapshot còn sót nghĩa
-        // là lần trước chết bất thường, người dùng lúc này nhiều khả năng
-        // đang không vào được mạng — đây là việc khẩn nhất app phải làm, nên
-        // bắn Task ngay dòng đầu tiên chứ không đợi cửa sổ dựng xong.
-        //
-        // Dùng `SystemProxyController.recoverIfNeeded`, KHÔNG phải
-        // `SyncProxyRestore.restoreNow`: đường đồng bộ chỉ `try?` đọc
-        // snapshot, snapshot hỏng thì lặng lẽ bỏ qua. `recoverIfNeeded` có
-        // đường cứu riêng cho snapshot hỏng (tắt dấu vết loopback đúng cổng
-        // của app), và đây là nơi duy nhất đường cứu đó được gọi tới. Mở app
-        // không bị giới hạn thời gian như lúc thoát, nên `await` thoải mái.
-        Task {
-            _ = try? await SystemProxyController().recoverIfNeeded()
+    /// Trần thời gian chặn lúc mở app. Khôi phục thật chỉ tốn vài trăm ms
+    /// (2 lệnh đọc + 2–3 lệnh ghi cho mỗi dịch vụ), nhưng một `networksetup`
+    /// treo không được phép treo luôn cả app: hết giờ thì thả cho cửa sổ hiện
+    /// ra trong khi việc khôi phục chạy tiếp ngầm. Cửa sổ có hiện sớm cũng
+    /// không sinh ra cuộc đua nữa — `enable()` tự đợi đúng task này.
+    private static let recoveryDeadline: DispatchTimeInterval = .seconds(10)
+
+    /// §4.3: khôi phục chạy XONG trước khi vẽ cửa sổ. `willFinishLaunching`
+    /// chạy trước khi scene nào được dựng, nên đây là chỗ duy nhất chặn được
+    /// mà không phải chặn một cửa sổ đã hiện ra.
+    ///
+    /// Chặn main thread có chủ ý: việc khôi phục không cần tới main thread
+    /// (actor của nó không phải `@MainActor`, và `networksetup` chạy trên một
+    /// `Thread` riêng), nên không có vòng chờ lẫn nhau nào ở đây. Đổi lại,
+    /// M4 quan sát được đúng như spec mô tả: `kill -9` rồi mở lại app thì
+    /// proxy đã tắt TRƯỚC khi cửa sổ hiện.
+    ///
+    /// Dùng `SystemProxyController.recoverAtLaunch`, KHÔNG phải
+    /// `SyncProxyRestore.restoreNow`: đường đồng bộ chỉ `try?` đọc snapshot,
+    /// snapshot hỏng thì lặng lẽ bỏ qua. Đường async có đường cứu riêng cho
+    /// snapshot hỏng (tắt dấu vết loopback đúng cổng của app), và đây là nơi
+    /// duy nhất đường cứu đó được gọi tới.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // ĐÚNG instance mà `AppModel` dùng. Hai instance riêng không loại trừ
+        // nhau được: trạng thái chung nằm ở file snapshot và ở cấu hình OS,
+        // và cái chốt chặn `enable()` trong lúc đang khôi phục chỉ chặn được
+        // lời gọi trên cùng một instance.
+        let controller = SystemProxyController.shared
+        let finished = DispatchSemaphore(value: 0)
+        Task.detached {
+            await controller.recoverAtLaunch()
+            finished.signal()
         }
+        _ = finished.wait(timeout: .now() + Self.recoveryDeadline)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Bảo hiểm cho đúng một tình huống: `willFinishLaunching` không tới
+        // được (SwiftUI gắn delegate qua `@NSApplicationDelegateAdaptor`, và
+        // thời điểm gắn không nằm trong tay ta). Thiếu nó thì hỏng theo hướng
+        // đắt nhất — không khôi phục lần nào cả. Gọi lại là vô hại: cùng một
+        // task, lần gọi thứ hai chỉ đợi kết quả của lần đầu.
+        Task { await SystemProxyController.shared.recoverAtLaunch() }
 
         installSignalHandler(SIGTERM)
         installSignalHandler(SIGINT)

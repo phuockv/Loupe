@@ -12,7 +12,9 @@ import Foundation
 public enum SyncProxyRestore {
     public typealias SyncRunner = ([String]) -> Result<String, SystemProxyError>
 
-    /// - Returns: true nếu có dọn gì đó.
+    /// - Returns: true nếu có dọn gì đó — tức có ít nhất một lệnh set/state
+    ///   thực sự được phát ra. Snapshot tồn tại và đọc được nhưng không dịch
+    ///   vụ nào còn trỏ vào ta (người dùng đã tự đổi hết) thì trả về false.
     @discardableResult
     public static func restoreNow(
         storeURL: URL,
@@ -32,22 +34,34 @@ public enum SyncProxyRestore {
 
         let binary = NetworkSetupConfigurer.binary
         var allSucceeded = true
+        var restoredAny = false
 
         for original in snapshot.services {
-            // Cùng luật với đường async: chỉ đụng dịch vụ còn trỏ vào ta.
-            guard case .success(let webOut) =
-                    run([binary, "-getwebproxy", original.service]),
-                  let currentWeb = try? NetworkSetupConfigurer.parseProxy(webOut)
+            // Cùng luật với đường async (SystemProxyController.restore):
+            // đọc CẢ HAI field rồi xét TỪNG FIELD riêng, không gộp OR chung
+            // một cổng cho cả dịch vụ. Người dùng thường chỉ đổi một field
+            // (vd. tự đặt proxy công ty cho HTTP, để yên HTTPS vẫn trỏ vào
+            // ta) — gộp sẽ đạp mất field họ vừa đổi, hoặc bỏ quên field kia
+            // làm dấu vết chết vĩnh viễn.
+            guard case .success(let webOut) = run([binary, "-getwebproxy", original.service]),
+                  let currentWeb = try? NetworkSetupConfigurer.parseProxy(webOut),
+                  case .success(let secureOut) = run([binary, "-getsecurewebproxy", original.service]),
+                  let currentSecureWeb = try? NetworkSetupConfigurer.parseProxy(secureOut)
             else { allSucceeded = false; continue }
 
-            guard currentWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort) else {
-                continue
-            }
+            let webStillOurs = currentWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
+            let secureStillOurs =
+                currentSecureWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
+            guard webStillOurs || secureStillOurs else { continue }
 
-            for (setting, setCmd, stateCmd) in [
-                (original.web, "-setwebproxy", "-setwebproxystate"),
-                (original.secureWeb, "-setsecurewebproxy", "-setsecurewebproxystate"),
+            for (stillOurs, setting, setCmd, stateCmd) in [
+                (webStillOurs, original.web, "-setwebproxy", "-setwebproxystate"),
+                (secureStillOurs, original.secureWeb, "-setsecurewebproxy", "-setsecurewebproxystate"),
             ] {
+                // Field không còn trỏ vào ta (người dùng đã tự đổi) thì để
+                // yên — không phát lệnh nào cho field đó.
+                guard stillOurs else { continue }
+                restoredAny = true
                 let commands: [[String]] = setting.enabled
                     ? [[binary, setCmd, original.service, setting.server, String(setting.port)],
                        [binary, stateCmd, original.service, "on"]]
@@ -61,6 +75,6 @@ public enum SyncProxyRestore {
         // Giữ file khi có bất kỳ lệnh nào hỏng: lần mở sau `recoverIfNeeded`
         // sẽ thử lại. Luật khôi phục là idempotent nên thử lại vô hại.
         if allSucceeded { try? store.delete() }
-        return true
+        return restoredAny
     }
 }

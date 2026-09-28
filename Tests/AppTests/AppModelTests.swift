@@ -34,6 +34,23 @@ actor FakeTrustStoreInstaller: TrustStoreInstaller {
     }
 }
 
+/// Test double cho `SimulatorTrustInstalling`. Không bao giờ exec `xcrun`
+/// thật — nếu không, test sẽ ghi CA vào simulator thật của máy chạy test.
+actor FakeSimulatorTrustInstaller: SimulatorTrustInstalling {
+    private(set) var callCount = 0
+    private var result: Result<SimulatorInstallReport, Error> =
+        .success(SimulatorInstallReport(installed: [], failed: []))
+
+    func setResult(_ result: Result<SimulatorInstallReport, Error>) {
+        self.result = result
+    }
+
+    func installOnBootedSimulators(pemPath: URL) async throws -> SimulatorInstallReport {
+        callCount += 1
+        return try result.get()
+    }
+}
+
 /// Test double cho `SystemProxyConfiguring`. Giữ trạng thái trong bộ nhớ,
 /// KHÔNG BAO GIỜ shell-out `/usr/sbin/networksetup` thật — nếu không, mọi
 /// test ở đây gọi `start()` sẽ đổi cấu hình mạng thật của máy đang chạy
@@ -105,6 +122,7 @@ struct AppModelTests {
     /// đang chạy `swift test`.
     private func makeModel(
         installer: FakeTrustStoreInstaller = FakeTrustStoreInstaller(),
+        simulatorInstaller: FakeSimulatorTrustInstaller = FakeSimulatorTrustInstaller(),
         listenPort: Int = 0,
         systemProxyConfigurer: FakeSystemProxyConfigurer = FakeSystemProxyConfigurer()
     ) -> AppModel {
@@ -119,7 +137,8 @@ struct AppModelTests {
             configurer: systemProxyConfigurer,
             store: ProxySnapshotStore(url: snapshotURL)
         )
-        return AppModel(configuration: config, installer: installer, caDirectory: dir,
+        return AppModel(configuration: config, installer: installer,
+                         simulatorInstaller: simulatorInstaller, caDirectory: dir,
                          systemProxy: systemProxy)
     }
 
@@ -251,6 +270,61 @@ struct AppModelTests {
         _ = await (first, second)
 
         #expect(await installer.installCallCount == 1)
+    }
+
+    @Test("installCertificateOnSimulators() thành công: báo số máy và tên từng máy")
+    func simulatorInstallSucceeds() async {
+        let simulators = FakeSimulatorTrustInstaller()
+        await simulators.setResult(.success(SimulatorInstallReport(
+            installed: ["iPhone 16", "iPhone Air"], failed: [])))
+        let model = makeModel(simulatorInstaller: simulators)
+
+        await model.installCertificateOnSimulators()
+
+        #expect(model.statusMessage == "Đã cài Root CA vào 2 simulator: iPhone 16, iPhone Air")
+        #expect(await simulators.callCount == 1)
+    }
+
+    @Test("installCertificateOnSimulators() lỗi một phần: nêu cả máy thành công lẫn máy lỗi kèm lý do")
+    func simulatorInstallPartialFailure() async {
+        let simulators = FakeSimulatorTrustInstaller()
+        await simulators.setResult(.success(SimulatorInstallReport(
+            installed: ["iPhone Air"],
+            failed: [.init(name: "iPhone 16", message: "Invalid device state")])))
+        let model = makeModel(simulatorInstaller: simulators)
+
+        await model.installCertificateOnSimulators()
+
+        #expect(model.statusMessage
+                == "Đã cài Root CA vào 1 simulator: iPhone Air. Lỗi ở iPhone 16: Invalid device state")
+    }
+
+    @Test("installCertificateOnSimulators() lỗi hết: không nói \"đã cài\"")
+    func simulatorInstallAllFailed() async {
+        let simulators = FakeSimulatorTrustInstaller()
+        await simulators.setResult(.success(SimulatorInstallReport(
+            installed: [], failed: [.init(name: "iPhone 16", message: "Invalid device state")])))
+        let model = makeModel(simulatorInstaller: simulators)
+
+        await model.installCertificateOnSimulators()
+
+        #expect(model.statusMessage == "Cài Root CA vào simulator thất bại. Lỗi ở iPhone 16: Invalid device state")
+    }
+
+    @Test("installCertificateOnSimulators() khi không có simulator nào chạy hoặc thiếu Xcode: báo đúng nguyên nhân")
+    func simulatorInstallErrors() async {
+        let simulators = FakeSimulatorTrustInstaller()
+        let model = makeModel(simulatorInstaller: simulators)
+
+        await simulators.setResult(.failure(SimulatorTrustError.noBootedSimulator))
+        await model.installCertificateOnSimulators()
+        #expect(model.statusMessage.contains("Không có simulator nào đang chạy"),
+                "status: \(model.statusMessage)")
+
+        await simulators.setResult(.failure(SimulatorTrustError.simctlUnavailable("xcrun: error")))
+        await model.installCertificateOnSimulators()
+        #expect(model.statusMessage.contains("Xcode") && model.statusMessage.contains("xcrun: error"),
+                "status: \(model.statusMessage)")
     }
 
     @Test("refreshCertificateStatus() phản ánh đúng true/false từ installer")

@@ -149,6 +149,9 @@ public struct ContentView: View {
         ToolbarItem {
             Menu {
                 Button("Cài Root CA") { Task { await model.installCertificate() } }
+                Button("Cài Root CA vào Simulator đang chạy") {
+                    Task { await model.installCertificateOnSimulators() }
+                }
                 Button("Kiểm tra lại trạng thái CA") {
                     Task { await model.refreshCertificateStatus() }
                 }

@@ -73,6 +73,7 @@ public final class AppModel {
 
     private let configuration: ProxyConfiguration
     private let installer: any TrustStoreInstaller
+    private let simulatorInstaller: any SimulatorTrustInstalling
 
     /// Thư mục chứa `ca.pem`/`ca.key.pem`. Mặc định là thư mục thật của ứng
     /// dụng; test truyền một thư mục tạm để không đụng tới Application
@@ -82,6 +83,7 @@ public final class AppModel {
     public init(
         configuration: ProxyConfiguration = ProxyConfiguration(),
         installer: any TrustStoreInstaller = SecurityCommandInstaller(),
+        simulatorInstaller: any SimulatorTrustInstalling = SimctlTrustInstaller(),
         store: TrafficStore = TrafficStore(),
         caDirectory: URL = CertificateAuthority.defaultDirectory,
         // `.shared`, KHÔNG phải một instance mới: `AppDelegate` chạy lần khôi
@@ -92,6 +94,7 @@ public final class AppModel {
     ) {
         self.configuration = configuration
         self.installer = installer
+        self.simulatorInstaller = simulatorInstaller
         self.store = store
         self.caDirectory = caDirectory
         self.systemProxy = systemProxy
@@ -346,5 +349,29 @@ public final class AppModel {
             statusMessage = "Cài Root CA thất bại: \(error.localizedDescription)"
         }
         await refreshCertificateStatus()
+    }
+
+    /// Cài Root CA vào mọi simulator iOS đang chạy. Simulator có trust store
+    /// riêng, không đọc keychain của Mac, nên `installCertificate()` không
+    /// giúp gì cho HTTPS từ simulator.
+    public func installCertificateOnSimulators() async {
+        let report: SimulatorInstallReport
+        do {
+            _ = try CertificateAuthority.loadOrCreate(in: caDirectory)
+            report = try await simulatorInstaller.installOnBootedSimulators(pemPath: pemPath)
+        } catch {
+            statusMessage = "Cài Root CA vào simulator thất bại: \(error.localizedDescription)"
+            return
+        }
+
+        var parts: [String] = []
+        if report.installed.isEmpty {
+            parts.append("Cài Root CA vào simulator thất bại")
+        } else {
+            parts.append("Đã cài Root CA vào \(report.installed.count) simulator: "
+                         + report.installed.joined(separator: ", "))
+        }
+        parts += report.failed.map { "Lỗi ở \($0.name): \($0.message)" }
+        statusMessage = parts.joined(separator: ". ")
     }
 }

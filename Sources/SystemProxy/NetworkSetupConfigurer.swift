@@ -127,7 +127,7 @@ public struct NetworkSetupConfigurer: SystemProxyConfiguring {
 
     /// Bản đồng bộ, dùng chung cho `runProcess` và cho đường khôi phục lúc
     /// thoát app (`SyncProxyRestore`), nơi không `await` được.
-    static func runProcessSync(_ arguments: [String]) -> Result<String, SystemProxyError> {
+    public static func runProcessSync(_ arguments: [String]) -> Result<String, SystemProxyError> {
         guard let first = arguments.first, first.hasPrefix("/") else {
             return .failure(.commandFailed(status: -1, output: "cần đường dẫn tuyệt đối"))
         }

@@ -63,3 +63,63 @@ struct ProxySnapshotStoreTests {
                 "xoá file lúc chưa khôi phục xong là vứt mất bản đồ đường về")
     }
 }
+
+@Suite("SyncProxyRestore")
+struct SyncProxyRestoreTests {
+
+    private func tempURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("sync-\(UUID().uuidString)")
+            .appendingPathComponent("snapshot.json")
+    }
+
+    @Test("Không có file thì không chạy lệnh nào và trả false")
+    func noopWithoutSnapshot() {
+        var commands: [[String]] = []
+        let done = SyncProxyRestore.restoreNow(storeURL: tempURL()) { args in
+            commands.append(args); return .success("")
+        }
+        #expect(done == false)
+        #expect(commands.isEmpty)
+    }
+
+    @Test("Có file thì gỡ proxy trên dịch vụ còn trỏ vào ta rồi xoá file")
+    func restoresAndDeletes() throws {
+        let url = tempURL()
+        let store = ProxySnapshotStore(url: url)
+        try store.write(ProxySnapshot(
+            takenAt: Date(), appliedHost: "127.0.0.1", appliedPort: 9090,
+            services: [ServiceProxySnapshot(service: "Wi-Fi", web: .off, secureWeb: .off)]))
+
+        var commands: [[String]] = []
+        let done = SyncProxyRestore.restoreNow(storeURL: url) { args in
+            commands.append(args)
+            // Giả lập: Wi-Fi vẫn đang trỏ vào ta.
+            if args.contains("-getwebproxy") || args.contains("-getsecurewebproxy") {
+                return .success("Enabled: Yes\nServer: 127.0.0.1\nPort: 9090")
+            }
+            return .success("")
+        }
+
+        #expect(done == true)
+        #expect(commands.contains(["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"]))
+        #expect(store.exists == false)
+    }
+
+    @Test("Lệnh hỏng thì GIỮ file lại cho lần mở sau")
+    func keepsSnapshotWhenCommandFails() throws {
+        let url = tempURL()
+        let store = ProxySnapshotStore(url: url)
+        try store.write(ProxySnapshot(
+            takenAt: Date(), appliedHost: "127.0.0.1", appliedPort: 9090,
+            services: [ServiceProxySnapshot(service: "Wi-Fi", web: .off, secureWeb: .off)]))
+
+        _ = SyncProxyRestore.restoreNow(storeURL: url) { args in
+            if args.contains("-getwebproxy") {
+                return .success("Enabled: Yes\nServer: 127.0.0.1\nPort: 9090")
+            }
+            return .failure(.commandFailed(status: 1, output: "giả lập lỗi"))
+        }
+        #expect(store.exists, "thoát app mà gỡ hỏng thì lần mở sau phải còn đường dọn")
+    }
+}

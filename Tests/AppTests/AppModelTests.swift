@@ -3,6 +3,7 @@ import Foundation
 import TrafficModel
 import CertKit
 import ProxyCore
+import SystemProxy
 @testable import AppCore
 
 /// Test double cho `TrustStoreInstaller`. Không bao giờ exec `security`/
@@ -33,6 +34,61 @@ actor FakeTrustStoreInstaller: TrustStoreInstaller {
     }
 }
 
+/// Test double cho `SystemProxyConfiguring`. Giữ trạng thái trong bộ nhớ,
+/// KHÔNG BAO GIỜ shell-out `/usr/sbin/networksetup` thật — nếu không, mọi
+/// test ở đây gọi `start()` sẽ đổi cấu hình mạng thật của máy đang chạy
+/// `swift test` (đúng lỗi mà toàn bộ tính năng System Proxy sinh ra để tránh).
+actor FakeSystemProxyConfigurer: SystemProxyConfiguring {
+    enum Event: Equatable {
+        case list
+        case read(String)
+        case apply(service: String, host: String, port: Int)
+        case restore(service: String, field: ProxyField, setting: ProxySetting)
+    }
+
+    private(set) var events: [Event] = []
+    private let services: [String]
+    /// Trạng thái hiện tại của mỗi dịch vụ — CẦN cập nhật ở `apply(...)` và
+    /// đọc lại ở `read(service:)`, vì `SystemProxyController.restore` tự đọc
+    /// lại qua `read` để kiểm tra "dịch vụ còn trỏ vào ta hay không" trước
+    /// khi quyết định khôi phục; nếu fake luôn báo "tắt" thì `restore` không
+    /// bao giờ được gọi và mọi khẳng định về khôi phục ở test sẽ sai.
+    private var current: [String: ServiceProxySnapshot] = [:]
+
+    init(services: [String] = ["Wi-Fi"]) {
+        self.services = services
+    }
+
+    func activeServices() async throws -> [String] {
+        events.append(.list)
+        return services
+    }
+
+    func read(service: String) async throws -> ServiceProxySnapshot {
+        events.append(.read(service))
+        return current[service] ?? ServiceProxySnapshot(service: service, web: .off, secureWeb: .off)
+    }
+
+    func apply(host: String, port: Int, to service: String) async throws {
+        events.append(.apply(service: service, host: host, port: port))
+        current[service] = ServiceProxySnapshot(
+            service: service,
+            web: ProxySetting(enabled: true, server: host, port: port),
+            secureWeb: ProxySetting(enabled: true, server: host, port: port))
+    }
+
+    func restore(_ setting: ProxySetting, field: ProxyField, of service: String) async throws {
+        events.append(.restore(service: service, field: field, setting: setting))
+        var snapshot = current[service]
+            ?? ServiceProxySnapshot(service: service, web: .off, secureWeb: .off)
+        switch field {
+        case .web: snapshot.web = setting
+        case .secureWeb: snapshot.secureWeb = setting
+        }
+        current[service] = snapshot
+    }
+}
+
 @MainActor
 @Suite("AppModel")
 struct AppModelTests {
@@ -40,15 +96,31 @@ struct AppModelTests {
     /// `caDirectory` luôn là một thư mục tạm riêng cho test — không bao giờ
     /// `CertificateAuthority.defaultDirectory` thật, nếu không mỗi lần chạy
     /// test sẽ ghi CA xuống đúng Application Support của máy đang chạy nó.
+    ///
+    /// `systemProxy` cũng luôn là một `SystemProxyController` cô lập — một
+    /// `FakeSystemProxyConfigurer` mới cộng một `ProxySnapshotStore` trỏ vào
+    /// thư mục tạm riêng — KHÔNG BAO GIỜ controller mặc định của `AppModel`.
+    /// Toggle `setSystemProxy` mặc định BẬT, nên bất kỳ test nào ở đây gọi
+    /// `start()` mà dùng controller thật sẽ đổi cấu hình mạng thật của máy
+    /// đang chạy `swift test`.
     private func makeModel(
         installer: FakeTrustStoreInstaller = FakeTrustStoreInstaller(),
-        listenPort: Int = 0
+        listenPort: Int = 0,
+        systemProxyConfigurer: FakeSystemProxyConfigurer = FakeSystemProxyConfigurer()
     ) -> AppModel {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppModelTests-\(UUID().uuidString)")
         var config = ProxyConfiguration()
         config.listenPort = listenPort
-        return AppModel(configuration: config, installer: installer, caDirectory: dir)
+        let snapshotURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppModelTests-snapshot-\(UUID().uuidString)")
+            .appendingPathComponent("snapshot.json")
+        let systemProxy = SystemProxyController(
+            configurer: systemProxyConfigurer,
+            store: ProxySnapshotStore(url: snapshotURL)
+        )
+        return AppModel(configuration: config, installer: installer, caDirectory: dir,
+                         systemProxy: systemProxy)
     }
 
     @Test("Trạng thái khởi tạo: chưa chạy, chưa biết CA đã cài hay chưa")
@@ -101,7 +173,11 @@ struct AppModelTests {
         await occupier.start()
         #expect(occupier.isRunning)
         // Port thật đang nghe chỉ lộ ra qua statusMessage ("Đang nghe ở host:port").
-        guard let port = Int(occupier.statusMessage.split(separator: ":").last ?? "") else {
+        // Từ Task 8, statusMessage có thể có thêm hậu tố sau phần port (ví dụ
+        // "— đã đặt proxy cho N dịch vụ mạng"), nên tách thêm theo khoảng
+        // trắng để chỉ lấy đúng chữ số của port.
+        let portText = occupier.statusMessage.split(separator: ":").last?.split(separator: " ").first
+        guard let portText, let port = Int(portText) else {
             Issue.record("không đọc được port từ: \(occupier.statusMessage)")
             await occupier.stop()
             return
@@ -203,5 +279,35 @@ struct AppModelTests {
         await model.refreshCertificateStatus()
         #expect(model.certificateInstalled == nil)
         #expect(model.statusMessage.contains("Không kiểm tra được"))
+    }
+
+    /// Chốt lại phát hiện ở Task 8: `start()`/`stop()` phải đi qua controller
+    /// ĐƯỢC TIÊM VÀO, không bao giờ chạm `/usr/sbin/networksetup` thật.
+    /// Khẳng định qua fake nhận đúng lệnh (list + apply lúc start, restore
+    /// lúc stop) — đây là cách khẳng định "không gọi lệnh thật" khả thi, vì
+    /// bản thân fake chính là thứ được gọi thay cho lệnh thật.
+    @Test("start()/stop() gọi qua SystemProxyController được tiêm vào, không đụng networksetup thật")
+    func usesInjectedSystemProxyController() async {
+        let fake = FakeSystemProxyConfigurer(services: ["Wi-Fi"])
+        let model = makeModel(systemProxyConfigurer: fake)
+
+        await model.start()
+        #expect(model.setSystemProxy == true)
+        #expect(model.statusMessage.contains("đã đặt proxy cho 1 dịch vụ mạng"),
+                "statusMessage: \(model.statusMessage)")
+
+        let eventsAfterStart = await fake.events
+        #expect(eventsAfterStart.contains(.list))
+        #expect(eventsAfterStart.contains { event in
+            if case .apply(service: "Wi-Fi", host: "127.0.0.1", port: _) = event { return true }
+            return false
+        })
+
+        await model.stop()
+        let eventsAfterStop = await fake.events
+        #expect(eventsAfterStop.contains { event in
+            if case .restore(service: "Wi-Fi", field: _, setting: _) = event { return true }
+            return false
+        })
     }
 }

@@ -2,13 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "ProxyManClone",
+    name: "Loupe",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "TrafficModel", targets: ["TrafficModel"]),
         .library(name: "CertKit", targets: ["CertKit"]),
+        .library(name: "SystemProxy", targets: ["SystemProxy"]),
         .library(name: "ProxyCore", targets: ["ProxyCore"]),
-        .executable(name: "ProxyManCloneApp", targets: ["ProxyManCloneApp"]),
+        .executable(name: "LoupeApp", targets: ["LoupeApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -26,6 +27,7 @@ let package = Package(
             .product(name: "Crypto", package: "swift-crypto"),
             .product(name: "SwiftASN1", package: "swift-asn1"),
         ]),
+        .target(name: "SystemProxy"),
         .target(name: "ProxyCore", dependencies: [
             "TrafficModel", "CertKit",
             .product(name: "NIOCore", package: "swift-nio"),
@@ -34,13 +36,13 @@ let package = Package(
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
         ]),
         .target(name: "AppCore", dependencies: [
-            "TrafficModel", "CertKit", "ProxyCore",
+            "TrafficModel", "CertKit", "ProxyCore", "SystemProxy",
         ]),
-        .executableTarget(name: "ProxyManCloneApp", dependencies: [
+        .executableTarget(name: "LoupeApp", dependencies: [
             "AppCore",
         ]),
         .testTarget(name: "TrafficModelTests", dependencies: ["TrafficModel"]),
-        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel", "CertKit", "ProxyCore"]),
+        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel", "CertKit", "ProxyCore", "SystemProxy"]),
         .testTarget(name: "CertKitTests", dependencies: [
             "CertKit",
             .product(name: "NIOCore", package: "swift-nio"),
@@ -58,5 +60,6 @@ let package = Package(
             .product(name: "NIOHTTP1", package: "swift-nio"),
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
         ]),
+        .testTarget(name: "SystemProxyTests", dependencies: ["SystemProxy"]),
     ]
 )

@@ -16,7 +16,7 @@
 - Binary luôn gọi bằng đường dẫn tuyệt đối `/usr/sbin/networksetup`. Không bao giờ qua shell — đối số truyền thẳng vào `Process.arguments`.
 - "Loopback" nhận đúng ba chuỗi, không phân biệt hoa thường: `127.0.0.1`, `::1`, `localhost`. Không nhận cả dải `127.0.0.0/8`.
 - Mọi kiểu công khai phải `Sendable`. Target build sạch dưới strict concurrency của Swift 6.
-- File snapshot: `~/Library/Application Support/ProxyManClone/system-proxy-snapshot.json`.
+- File snapshot: `~/Library/Application Support/Loupe/system-proxy-snapshot.json`.
 - Text hiển thị cho người dùng viết bằng tiếng Việt, khớp giọng văn các chuỗi sẵn có trong `AppModel`.
 - Toggle mới **không** lưu qua các lần mở app — mặc định BẬT, giống `allowLANDevices` và `forceDecompressible`.
 
@@ -56,7 +56,7 @@ Năm lớp đầu vào mà spec ngụ ý nhưng dễ rơi khỏi test. Mỗi dò
 | `Package.swift` | Thêm target `SystemProxy` + test target; `AppCore` phụ thuộc `SystemProxy`. |
 | `Sources/AppCore/AppModel.swift` | Thêm `setSystemProxy` toggle và nối vào `start()`/`stop()`. |
 | `Sources/AppCore/ContentView.swift` | Thêm toggle thứ ba vào `.safeAreaInset(edge: .bottom)`. |
-| `Sources/ProxyManCloneApp/App.swift` | `NSApplicationDelegateAdaptor`: khôi phục lúc mở, gỡ lúc thoát, bắt `SIGTERM`/`SIGINT`. |
+| `Sources/LoupeApp/App.swift` | `NSApplicationDelegateAdaptor`: khôi phục lúc mở, gỡ lúc thoát, bắt `SIGTERM`/`SIGINT`. |
 
 ---
 
@@ -830,7 +830,7 @@ public struct ProxySnapshotStore: Sendable {
     public static var defaultURL: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ProxyManClone", isDirectory: true)
+            .appendingPathComponent("Loupe", isDirectory: true)
             .appendingPathComponent("system-proxy-snapshot.json")
     }
 
@@ -1798,7 +1798,7 @@ git commit -m "feat(AppCore): toggle đặt proxy hệ thống, nối vào start
 ## Task 9: Vòng đời app — khôi phục lúc mở, gỡ lúc thoát, bắt signal
 
 **Files:**
-- Modify: `Sources/ProxyManCloneApp/App.swift`
+- Modify: `Sources/LoupeApp/App.swift`
 
 **Interfaces:**
 - Consumes: `SyncProxyRestore`, `ProxySnapshotStore.defaultURL`, `SystemProxyController` (Task 4, 6, 7)
@@ -1807,7 +1807,7 @@ git commit -m "feat(AppCore): toggle đặt proxy hệ thống, nối vào start
 - [ ] **Step 1: Viết `AppDelegate`**
 
 ```swift
-// Sources/ProxyManCloneApp/App.swift
+// Sources/LoupeApp/App.swift
 import SwiftUI
 import AppKit
 import Dispatch
@@ -1853,7 +1853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct ProxyManCloneApp: App {
+struct LoupeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
@@ -1865,7 +1865,7 @@ struct ProxyManCloneApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("ProxyManClone") {
+        WindowGroup("Loupe") {
             ContentView()
                 .frame(minWidth: 1000, minHeight: 640)
         }
@@ -1881,7 +1881,7 @@ Expected: build sạch, toàn bộ test PASS.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add Sources/ProxyManCloneApp/App.swift
+git add Sources/LoupeApp/App.swift
 git commit -m "feat(App): dọn proxy lúc mở app, lúc thoát, và khi bị SIGTERM"
 ```
 
@@ -1898,7 +1898,7 @@ Ba lỗi nặng nhất của dự án này — `TabView` không vẽ thanh tab, 
 ```bash
 ./Scripts/make-app.sh
 networksetup -getwebproxy Wi-Fi | tee /tmp/before-manual.txt
-open ProxyManClone.app
+open Loupe.app
 ```
 
 - [ ] **Step 2: M7 — dọn mớ cũ**
@@ -1936,11 +1936,11 @@ Expected: `Enabled: No`.
 - [ ] **Step 5: M4 — SIGKILL rồi mở lại**
 
 ```bash
-open ProxyManClone.app   # bấm Chạy trong app
+open Loupe.app   # bấm Chạy trong app
 networksetup -getwebproxy Wi-Fi          # Enabled: Yes
-pkill -9 -f "ProxyManClone.app/Contents/MacOS"
+pkill -9 -f "Loupe.app/Contents/MacOS"
 networksetup -getwebproxy Wi-Fi          # vẫn Yes — đúng, không tránh được
-open ProxyManClone.app
+open Loupe.app
 sleep 3
 networksetup -getwebproxy Wi-Fi          # phải là No
 ```

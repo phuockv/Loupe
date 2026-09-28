@@ -1,4 +1,4 @@
-# Nhật ký quyết định — MVP ProxyManClone
+# Nhật ký quyết định — MVP Loupe
 
 Ngày: 2026-09-05 → 2026-09-06. Nhánh `feat/mvp`, 34 commit, 149 test.
 
@@ -212,3 +212,54 @@ nó vốn chạy được.
 và khen là "well built" — quoting đúng, guard đúng, không chèn lệnh được. Nó
 đúng về mọi mặt trừ một: **nó không chạy được**. Không vòng review nào bắt được,
 vì không ai bấm nút thật. Chỉ có người dùng trên máy thứ hai bấm mới lộ ra.
+
+---
+
+## 2026-09-28 — Kiểm thủ công M1–M7 cho tính năng tự đặt/gỡ proxy hệ thống
+
+Chạy trên máy thật, macOS 15.5, 4 dịch vụ mạng hoạt động (Wi-Fi, Thunderbolt
+Bridge, và hai VPN: `phuoc.kieu-c-sg`, `Urban VPN Desktop`).
+
+| Mục | Kết quả | Bằng chứng |
+| --- | --- | --- |
+| **M1** | ĐẠT | Probe `.app` ad-hoc sign: `SET exit=0` trong 0,1s, `GET` xác nhận `127.0.0.1:9099`, `uid=502 euid=502`, không hộp thoại. Thời gian 0,1s là bằng chứng quyết định — hộp thoại mật khẩu sẽ chặn tiến trình. Rủi ro §7.1 (hình dạng §6.3 Root CA) loại bỏ. |
+| **M2** | ĐẠT | Bấm Chạy → cả 4 dịch vụ đều `Yes, 127.0.0.1, 9090`, **kể cả dịch vụ VPN đang là primary**. Không hộp thoại. Bấm Dừng → cả 4 về `No`. |
+| **M3** | ĐẠT | ⌘Q khi đang bắt → cả 4 dịch vụ về `No`, snapshot xoá, `curl` HTTP 200. |
+| **M4** | **ĐẠT MỘT NỬA** | Chức năng ĐẠT: `kill -9` với proxy đang bật → proxy còn bật, snapshot sống sót; mở lại → dọn sạch, snapshot xoá, mạng thông. Đảm bảo THỜI ĐIỂM chưa chứng minh được — xem bên dưới. |
+| **M5** | KHÔNG CHẠY | Cần bật/tắt VPN của người dùng; ngoài tầm tự động hoá. |
+| **M6** | ĐẠT | Đang bắt, tự đặt Wi-Fi HTTP sang `127.0.0.1:8888` → bấm Dừng → HTTP **giữ nguyên `Yes, 8888`**, HTTPS (vẫn trỏ ta) về `No`, Thunderbolt Bridge cả hai về `No`. |
+| **M7** | ĐẠT | Máy có sẵn mớ cũ Wi-Fi HTTPS `Yes, 127.0.0.1:9090` tồn tại nhiều ngày. Chạy → snapshot ghi trường đó là **tắt** (nhận ra dấu vết của chính app, §2.3). Dừng → về `No`, KHÔNG quay lại 9090. Mớ cũ đã dọn sạch. |
+
+### M6 là màn nghiệm thu giá trị nhất
+
+Nó chứng minh luật per-field (Ruling 5 và 6) trên phần cứng thật, đúng kịch bản
+hỗn hợp: một trường bị người dùng đổi, một trường vẫn của app. Trước hai ruling
+đó, cổng OR sẽ khôi phục cả hai trường và **đạp mất giá trị 8888** người dùng vừa
+đặt. Không test đơn vị nào chạy trên `networksetup` thật, nên đây là lần đầu hành
+vi đó được xác nhận ở tầng lệnh.
+
+### M4: khoảng trống còn lại
+
+Đo bằng hai luồng lấy mẫu độc lập (proxy ~30 ms/mẫu):
+- tiến trình mới xuất hiện: ~0,04 s
+- **proxy được dọn: 0,58 s**
+- cửa sổ trả lời accessibility: trong khoảng 0,04–0,28 s
+
+Tức **cửa sổ sẵn sàng trước khi dọn xong khoảng 300–540 ms**, dù
+`applicationWillFinishLaunching` có chặn bằng `DispatchSemaphore`. Một probe
+SwiftUI độc lập xác nhận `willFinishLaunching` CÓ kích hoạt dưới
+`@NSApplicationDelegateAdaptor` và đi trước cửa sổ ~258 ms — nên cơ chế đúng,
+nhưng thời gian dọn thật (8–12 lần spawn `networksetup`) vượt quá khoảng đó.
+
+Hạn chế của phép đo, nói rõ: luồng accessibility chỉ lấy mẫu mỗi ~240 ms và dấu
+thời gian được đóng TRƯỚC lời gọi, nên mốc "cửa sổ hiện" là một khoảng chứ không
+phải một điểm.
+
+**Phần nguy hiểm đã đóng bất kể điều trên.** Cuộc đua C3 (bấm Chạy trong lúc đang
+khôi phục) được chặn bởi cổng `beginRecovery()` bên trong actor, không phải bởi
+thời điểm vẽ cửa sổ. Hệ quả còn lại chỉ là thẩm mỹ: có một khoảnh khắc cửa sổ đã
+hiện mà proxy cũ chưa gỡ xong.
+
+Câu chữ §4.3 ("khôi phục chạy XONG trước khi vẽ cửa sổ") vì vậy mô tả mạnh hơn
+hành vi quan sát được. Cần chốt: hoặc sửa spec cho khớp thực tế, hoặc đổi thiết kế
+để chặn thật sự tới khi xong.

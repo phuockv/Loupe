@@ -1,4 +1,4 @@
-# ProxyManClone — Thiết kế MVP
+# Loupe — Thiết kế MVP
 
 Ngày: 2026-09-05
 Trạng thái: đã duyệt, sẵn sàng lập implementation plan
@@ -58,13 +58,13 @@ cần lock nào.
 ## 3. Cấu trúc module
 
 ```
-ProxyManClone/
+Loupe/
 ├── Package.swift
 ├── Sources/
 │   ├── TrafficModel/      value type thuần, Sendable, KHÔNG import NIO
 │   ├── CertKit/           Root CA, leaf minting, cài trust store
 │   ├── ProxyCore/         engine NIO, KHÔNG import SwiftUI
-│   └── ProxyManCloneApp/  SwiftUI (executableTarget)
+│   └── LoupeApp/  SwiftUI (executableTarget)
 ├── Tests/
 │   ├── CertKitTests/
 │   └── ProxyCoreTests/
@@ -72,7 +72,7 @@ ProxyManClone/
 ```
 
 Quy tắc phụ thuộc, một chiều:
-`TrafficModel` ← `CertKit`, `ProxyCore` ← `ProxyManCloneApp`.
+`TrafficModel` ← `CertKit`, `ProxyCore` ← `LoupeApp`.
 `TrafficModel` không phụ thuộc gì. Vi phạm chiều này là dấu hiệu sai thiết kế.
 
 ## 4. Data model (`TrafficModel`)
@@ -141,7 +141,7 @@ public enum TrafficEvent: Sendable {
 ```
 
 Ngưỡng cụ thể: body <= **2 MB** giữ trong RAM (`.inMemory`). Vượt ngưỡng thì ghi
-trọn vẹn ra `FileManager.default.temporaryDirectory/ProxyManClone/<uuid>` và dùng
+trọn vẹn ra `FileManager.default.temporaryDirectory/Loupe/<uuid>` và dùng
 `.file`. `.truncated` là đường thoát hiểm duy nhất khi ghi đĩa thất bại — giữ 2 MB
 đầu nhưng vẫn ghi `totalBytes` thật để inspector báo đúng cho người dùng.
 Không có cơ chế spill này, bắt một lần tải video là app phình vài GB.
@@ -203,7 +203,7 @@ public struct ProxyConfiguration: Sendable {
 
 swift-certificates + swift-crypto. Khoá P-256, hạn 10 năm, `basicConstraints: CA`
 (critical), `keyUsage: keyCertSign, cRLSign`, có Subject Key Identifier.
-Lưu PEM tại `~/Library/Application Support/ProxyManClone/ca/` với quyền `0600`.
+Lưu PEM tại `~/Library/Application Support/Loupe/ca/` với quyền `0600`.
 Sinh một lần, load lại nếu đã tồn tại.
 
 ### 6.2 Leaf certificate
@@ -290,7 +290,7 @@ Filter tuyến tính trên ≤5.000 dòng (<1ms), chưa cần index ngược.
 Platform: macOS 14.0+ (cần `@Observable` và `Table`). Toolchain Swift 6.3 / Xcode 26.6.
 
 **Vỏ app**: MVP dùng `executableTarget` của SPM, chạy bằng `swift run
-ProxyManCloneApp`, gọi `NSApplication.shared.setActivationPolicy(.regular)` trong
+LoupeApp`, gọi `NSApplication.shared.setActivationPolicy(.regular)` trong
 `init()` để cửa sổ focus đúng. Đổi sang Xcode app target khi cần code signing,
 Info.plist và notarization — quyết định đó còn treo (xem 11.2).
 

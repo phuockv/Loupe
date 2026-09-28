@@ -47,7 +47,7 @@ public struct ProxyConfiguration: Sendable {
         ],
         maxInMemoryBodyBytes: Int = 2 * 1024 * 1024,
         bodySpillDirectory: URL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ProxyManClone", isDirectory: true)
+            .appendingPathComponent("Loupe", isDirectory: true)
     ) {
         self.listenHost = listenHost
         self.listenPort = listenPort

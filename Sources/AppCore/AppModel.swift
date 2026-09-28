@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import CertKit
 import ProxyCore
+import SystemProxy
 import TrafficModel
 
 /// Chủ sở hữu vòng đời của proxy (start/stop), của việc cài Root CA vào
@@ -43,8 +44,18 @@ public final class AppModel {
     /// nó THAY ĐỔI thứ đi trên dây, nên mặc định tắt.
     public private(set) var forceDecompressible = false
 
+    /// Tự đặt proxy hệ thống lên mọi dịch vụ mạng khi Chạy, và gỡ khi Dừng.
+    ///
+    /// KHÔNG lưu qua các lần mở app — giống `allowLANDevices` và
+    /// `forceDecompressible`. Với một công tắc đổi cài đặt mạng toàn máy, về
+    /// giá trị đã biết mỗi lần mở an toàn hơn là âm thầm khôi phục lựa chọn
+    /// của phiên trước.
+    public private(set) var setSystemProxy = true
+
     private var server: ProxyServer?
     private var consumeTask: Task<Void, Never>?
+    private var listeningPort: Int?
+    private let systemProxy: SystemProxyController
 
     /// Task thật sự chạy `installer.install(pemPath:)`, sở hữu bởi AppModel
     /// chứ không phải bởi view gọi `installCertificate()`.
@@ -72,12 +83,18 @@ public final class AppModel {
         configuration: ProxyConfiguration = ProxyConfiguration(),
         installer: any TrustStoreInstaller = SecurityCommandInstaller(),
         store: TrafficStore = TrafficStore(),
-        caDirectory: URL = CertificateAuthority.defaultDirectory
+        caDirectory: URL = CertificateAuthority.defaultDirectory,
+        // `.shared`, KHÔNG phải một instance mới: `AppDelegate` chạy lần khôi
+        // phục lúc mở app trên đúng instance này, và cái chốt chặn `enable()`
+        // trong lúc đang khôi phục chỉ chặn được lời gọi trên cùng instance.
+        // Test vẫn tiêm controller cô lập của mình vào đây như cũ.
+        systemProxy: SystemProxyController = .shared
     ) {
         self.configuration = configuration
         self.installer = installer
         self.store = store
         self.caDirectory = caDirectory
+        self.systemProxy = systemProxy
     }
 
     private var pemPath: URL {
@@ -119,6 +136,77 @@ public final class AppModel {
         guard isRunning else { return }
         await stop()
         await start()
+    }
+
+    /// Khác hai toggle kia: KHÔNG đi qua `restartIfRunning()`. Dựng lại cả
+    /// engine chỉ để đổi cài đặt mạng là thừa, và nó sẽ cắt đứt mọi kết nối
+    /// đang mở. Bật/gỡ thẳng là đủ.
+    public func setSetSystemProxy(_ enabled: Bool) async {
+        guard enabled != setSystemProxy else { return }
+        setSystemProxy = enabled
+        guard isRunning, let port = listeningPort else { return }
+        if enabled {
+            await applySystemProxy(port: port)
+        } else {
+            await removeSystemProxy()
+        }
+    }
+
+    /// Đặt proxy hệ thống, và hạ toggle nếu thất bại.
+    ///
+    /// Toggle phải phản ánh THỰC TẾ, không phản ánh ý định: để nó bật trong
+    /// khi không đặt được gì là nói dối người dùng về trạng thái máy họ.
+    /// Engine vẫn chạy — nó đã bind rồi và vẫn dùng được qua cờ
+    /// `--proxy-server` hoặc cấu hình tay.
+    private func applySystemProxy(port: Int) async {
+        do {
+            let services = try await systemProxy.enable(host: "127.0.0.1", port: port)
+            statusMessage += " — đã đặt proxy cho \(services.count) dịch vụ mạng"
+        } catch {
+            setSystemProxy = false
+            statusMessage += " — KHÔNG đặt được proxy hệ thống: \(error.localizedDescription)"
+        }
+    }
+
+    private func removeSystemProxy() async {
+        do {
+            try await systemProxy.disable()
+        } catch {
+            // Đây là trạng thái có thể đang mất mạng, nên nó phải ồn và phải
+            // kèm đúng lệnh người dùng gõ được để tự cứu.
+            statusMessage = Self.systemProxyRescueMessage(
+                error: error, services: await systemProxy.snapshotServices())
+        }
+    }
+
+    /// Thông báo tự cứu khi gỡ proxy thất bại.
+    ///
+    /// Tên dịch vụ lấy từ chính snapshot, KHÔNG hard-code "Wi-Fi". Cả tính
+    /// năng này sinh ra vì dịch vụ chính thường KHÔNG phải Wi-Fi — sự cố gốc
+    /// là một VPN. Đưa cho một người đang mắc kẹt ngoài mạng hai câu lệnh
+    /// không sửa được gì còn tệ hơn là không đưa gì.
+    ///
+    /// Snapshot đọc không được thì không bịa tên: chỉ đường để họ tự liệt kê.
+    static func systemProxyRescueMessage(error: Error, services: [String]) -> String {
+        let commands: String
+        if services.isEmpty {
+            commands = """
+            networksetup -listallnetworkservices
+            rồi với TỪNG dịch vụ trong danh sách đó:
+            networksetup -setwebproxystate "<tên dịch vụ>" off
+            networksetup -setsecurewebproxystate "<tên dịch vụ>" off
+            """
+        } else {
+            commands = services.flatMap {
+                ["networksetup -setwebproxystate \"\($0)\" off",
+                 "networksetup -setsecurewebproxystate \"\($0)\" off"]
+            }.joined(separator: "\n")
+        }
+        return """
+        GỠ PROXY HỆ THỐNG THẤT BẠI: \(error.localizedDescription)
+        Máy có thể đang không vào mạng được. Mở Terminal và chạy:
+        \(commands)
+        """
     }
 
     /// Văn bản trạng thái sau khi bind thành công.
@@ -183,6 +271,10 @@ public final class AppModel {
                 port: port,
                 lanAddress: config.listenHost == "0.0.0.0" ? Self.localNetworkAddress() : nil
             )
+            listeningPort = port
+            if setSystemProxy {
+                await applySystemProxy(port: port)
+            }
         } catch {
             // `nil` khi lỗi xảy ra TRƯỚC lúc dựng server (CA/leaf cache) —
             // lúc đó chưa có group nào để dọn.
@@ -192,6 +284,11 @@ public final class AppModel {
     }
 
     public func stop() async {
+        // Gỡ proxy hệ thống TRƯỚC guard bên dưới: nó phải được gỡ kể cả khi
+        // engine đã chết, không thì một engine chết để lại proxy của máy trỏ
+        // vào một cổng đã đóng.
+        await removeSystemProxy()
+        listeningPort = nil
         guard let server else { return }
         // Đợi shutdown xong RỒI mới hạ `isRunning`: hạ trước, khi hàm này
         // còn đang `await` (tức đã nhường MainActor), sẽ để một `start()`

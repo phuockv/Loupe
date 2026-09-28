@@ -101,7 +101,11 @@ struct AppModelTests {
         await occupier.start()
         #expect(occupier.isRunning)
         // Port thật đang nghe chỉ lộ ra qua statusMessage ("Đang nghe ở host:port").
-        guard let port = Int(occupier.statusMessage.split(separator: ":").last ?? "") else {
+        // Từ Task 8, statusMessage có thể có thêm hậu tố sau phần port (ví dụ
+        // "— đã đặt proxy cho N dịch vụ mạng"), nên tách thêm theo khoảng
+        // trắng để chỉ lấy đúng chữ số của port.
+        let portText = occupier.statusMessage.split(separator: ":").last?.split(separator: " ").first
+        guard let portText, let port = Int(portText) else {
             Issue.record("không đọc được port từ: \(occupier.statusMessage)")
             await occupier.stop()
             return

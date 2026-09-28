@@ -36,13 +36,13 @@ let package = Package(
             .product(name: "NIOSSL", package: "swift-nio-ssl"),
         ]),
         .target(name: "AppCore", dependencies: [
-            "TrafficModel", "CertKit", "ProxyCore",
+            "TrafficModel", "CertKit", "ProxyCore", "SystemProxy",
         ]),
         .executableTarget(name: "ProxyManCloneApp", dependencies: [
             "AppCore",
         ]),
         .testTarget(name: "TrafficModelTests", dependencies: ["TrafficModel"]),
-        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel", "CertKit", "ProxyCore"]),
+        .testTarget(name: "AppTests", dependencies: ["AppCore", "TrafficModel", "CertKit", "ProxyCore", "SystemProxy"]),
         .testTarget(name: "CertKitTests", dependencies: [
             "CertKit",
             .product(name: "NIOCore", package: "swift-nio"),

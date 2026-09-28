@@ -63,6 +63,15 @@ public struct ContentView: View {
                 .controlSize(.mini)
                 .help("Bind 0.0.0.0 để iPhone hoặc máy khác cùng Wi-Fi dùng được proxy. "
                     + "Bật lên là bất kỳ ai trong mạng cũng đi qua được — tắt khi xong.")
+
+                Toggle("Đặt proxy cho máy này", isOn: Binding(
+                    get: { model.setSystemProxy },
+                    set: { on in Task { await model.setSetSystemProxy(on) } }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Tự đặt proxy hệ thống lên mọi dịch vụ mạng khi Chạy, và gỡ khi Dừng. "
+                    + "Tắt nếu bạn chỉ muốn bắt traffic từ iPhone và không muốn máy Mac đi qua proxy.")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)

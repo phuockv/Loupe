@@ -76,6 +76,28 @@ struct NetworkSetupConfigurerTests {
         }
     }
 
+    @Test("Đang bật nhưng Port không phải số thì ném lỗi, không rơi về 0")
+    func throwsWhenEnabledWithGarbagePort() {
+        #expect(throws: SystemProxyError.self) {
+            try NetworkSetupConfigurer.parseProxy("Enabled: Yes\nServer: 127.0.0.1\nPort: abc")
+        }
+    }
+
+    @Test("Đang bật nhưng thiếu Server thì ném lỗi, không rơi về rỗng")
+    func throwsWhenEnabledWithMissingServer() {
+        #expect(throws: SystemProxyError.self) {
+            try NetworkSetupConfigurer.parseProxy("Enabled: Yes\nPort: 9090")
+        }
+    }
+
+    @Test("Đang tắt với Server rỗng và Port 0 vẫn parse được, không bị coi là lỗi")
+    func disabledWithEmptyServerAndZeroPortStillParses() throws {
+        let setting = try NetworkSetupConfigurer.parseProxy("Enabled: No\nServer: \nPort: 0")
+        #expect(setting.enabled == false)
+        #expect(setting.server == "")
+        #expect(setting.port == 0)
+    }
+
     @Test("apply đặt cả HTTP lẫn HTTPS, dùng đường dẫn tuyệt đối")
     func applySetsBothProtocols() async throws {
         let fake = FakeRunner(outputs: ["", ""])
@@ -110,8 +132,10 @@ struct NetworkSetupConfigurerTests {
         try await sut.restore(ServiceProxySnapshot(service: "Wi-Fi", web: corporate, secureWeb: .off))
 
         let commands = await fake.commands
-        #expect(commands.first == ["/usr/sbin/networksetup", "-setwebproxy",
-                                   "Wi-Fi", "proxy.corp.local", "3128"])
-        #expect(commands.contains(["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "on"]))
+        #expect(commands == [
+            ["/usr/sbin/networksetup", "-setwebproxy", "Wi-Fi", "proxy.corp.local", "3128"],
+            ["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "on"],
+            ["/usr/sbin/networksetup", "-setsecurewebproxystate", "Wi-Fi", "off"],
+        ])
     }
 }

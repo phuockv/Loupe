@@ -44,11 +44,30 @@ public struct NetworkSetupConfigurer: SystemProxyConfiguring {
         guard let enabledText = field("Enabled") else {
             throw SystemProxyError.unreadableOutput(command: "getwebproxy", output: output)
         }
-        return ProxySetting(
-            enabled: enabledText.lowercased() == "yes",
-            server: field("Server") ?? "",
-            port: Int(field("Port") ?? "0") ?? 0
-        )
+        let enabled = enabledText.lowercased() == "yes"
+
+        // Khi Enabled: No, `networksetup` hợp lệ in ra `Server: ` (rỗng) và
+        // `Port: 0` — đó là input hợp lệ, không phải input hỏng, nên giữ
+        // nguyên cách đọc khoan dung cho nhánh này.
+        guard enabled else {
+            return ProxySetting(
+                enabled: false,
+                server: field("Server") ?? "",
+                port: Int(field("Port") ?? "0") ?? 0
+            )
+        }
+
+        // Khi Enabled: Yes, Server rỗng/thiếu hoặc Port không phải cổng hợp
+        // lệ là output hỏng — không được lặng lẽ rơi về "", 0: giá trị bịa
+        // đó sẽ bị ghi vào snapshot làm "nguyên bản", rồi lúc restore phát ra
+        // `-setwebproxy <svc> "" 0`, một câu lệnh `networksetup` từ chối.
+        guard let server = field("Server"), !server.isEmpty else {
+            throw SystemProxyError.unreadableOutput(command: "getwebproxy", output: output)
+        }
+        guard let portText = field("Port"), let port = Int(portText), (1...65535).contains(port) else {
+            throw SystemProxyError.unreadableOutput(command: "getwebproxy", output: output)
+        }
+        return ProxySetting(enabled: true, server: server, port: port)
     }
 
     // MARK: - SystemProxyConfiguring

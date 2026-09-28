@@ -239,6 +239,54 @@ struct SystemProxyControllerTests {
                 "ý muốn mới của người dùng phải thắng dấu vết cũ của ta")
     }
 
+    @Test("Chỉ HTTP bị đổi: giữ nguyên HTTP của người dùng, chỉ trả lại HTTPS")
+    func restoresOnlyTheFieldStillPointingAtUs_httpChanged() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi"])
+        let sut = SystemProxyController(configurer: fake, store: store)
+        _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+
+        // Người dùng tự đặt proxy công ty cho HTTP, để yên HTTPS (vẫn trỏ vào ta).
+        let corporateHTTP = ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128)
+        try await fake.restore(ServiceProxySnapshot(
+            service: "Wi-Fi",
+            web: corporateHTTP,
+            secureWeb: ProxySetting(enabled: true, server: "127.0.0.1", port: 9090)))
+        await fake.clearEvents()
+
+        try await sut.disable()
+
+        let restored = try #require(await fake.lastRestored(for: "Wi-Fi"))
+        #expect(restored.web == corporateHTTP,
+                "field người dùng vừa đổi phải được giữ nguyên, không bị đạp mất")
+        #expect(restored.secureWeb.enabled == false,
+                "field vẫn còn là dấu vết của ta thì phải được trả lại")
+    }
+
+    @Test("Chỉ HTTPS bị đổi: giữ nguyên HTTPS của người dùng, chỉ trả lại HTTP")
+    func restoresOnlyTheFieldStillPointingAtUs_secureWebChanged() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi"])
+        let sut = SystemProxyController(configurer: fake, store: store)
+        _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+
+        // Người dùng tự đặt proxy công ty cho HTTPS, để yên HTTP (vẫn trỏ vào ta).
+        let corporateHTTPS = ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128)
+        try await fake.restore(ServiceProxySnapshot(
+            service: "Wi-Fi",
+            web: ProxySetting(enabled: true, server: "127.0.0.1", port: 9090),
+            secureWeb: corporateHTTPS))
+        await fake.clearEvents()
+
+        try await sut.disable()
+
+        let restored = try #require(await fake.lastRestored(for: "Wi-Fi"))
+        #expect(restored.secureWeb == corporateHTTPS,
+                "field người dùng vừa đổi phải được giữ nguyên, không bị đạp mất")
+        #expect(restored.web.enabled == false,
+                "field vẫn còn là dấu vết của ta thì phải được trả lại")
+    }
+
     @Test("Nhận diện dấu vết dùng appliedPort trong snapshot, không dùng cổng hiện tại")
     func usesAppliedPortFromSnapshotNotCurrentPort() async throws {
         let store = tempStore()

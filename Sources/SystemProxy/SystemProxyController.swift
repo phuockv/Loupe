@@ -120,9 +120,9 @@ public actor SystemProxyController {
             // loopback đúng cổng ta chắc chắn do ta để lại, nên tắt nó an
             // toàn kể cả khi không biết trạng thái gốc. Không đoán gì thêm
             // ngoài phạm vi đó — proxy của người khác không bị đụng.
-            try await turnOffOwnLeftovers(host: "127.0.0.1", port: fallbackPort)
+            let changed = try await turnOffOwnLeftovers(host: "127.0.0.1", port: fallbackPort)
             try store.delete()
-            return true
+            return changed
         }
 
         try await restore(snapshot)
@@ -131,27 +131,42 @@ public actor SystemProxyController {
     }
 
     /// Luật chung cho mọi đường khôi phục: chỉ đụng dịch vụ mà cấu hình HIỆN
-    /// TẠI vẫn đang trỏ vào ta.
+    /// TẠI vẫn đang trỏ vào ta — và xét TỪNG FIELD riêng, không gộp chung.
     ///
     /// Không có luật này thì kịch bản sau làm hỏng việc thật: app crash →
     /// người dùng mất mạng → họ tự đặt proxy công ty → mở lại app → app lẳng
     /// lặng đạp mất cấu hình vừa đặt, viện cớ "khôi phục". Ý muốn mới của
     /// người dùng phải thắng dấu vết cũ của ta.
     ///
+    /// Xét theo dịch vụ (gộp OR hai field rồi khôi phục CẢ HAI) là sai: người
+    /// dùng thường chỉ đổi một field (vd. tự đặt proxy công ty cho HTTP, để
+    /// yên HTTPS vẫn trỏ vào ta) — gộp OR sẽ khôi phục luôn field họ vừa đổi,
+    /// đạp mất nó. Xét theo field, mỗi bên độc lập: field nào người dùng đã
+    /// đổi thì giữ nguyên giá trị hiện tại của họ; field nào vẫn còn là dấu
+    /// vết của ta thì trả về bản gốc. Không field nào còn là của ta thì bỏ
+    /// qua cả dịch vụ, không gọi lệnh nào.
+    ///
     /// Luật này cũng làm việc khôi phục idempotent: chạy lại bao nhiêu lần
     /// cũng không hại.
     private func restore(_ snapshot: ProxySnapshot) async throws {
         for original in snapshot.services {
             let current = try await configurer.read(service: original.service)
-            let stillOurs =
+            let webStillOurs =
                 current.web.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
-                || current.secureWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
-            guard stillOurs else { continue }
-            try await configurer.restore(original)
+            let secureStillOurs =
+                current.secureWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
+            guard webStillOurs || secureStillOurs else { continue }
+            try await configurer.restore(ServiceProxySnapshot(
+                service: original.service,
+                web: webStillOurs ? original.web : current.web,
+                secureWeb: secureStillOurs ? original.secureWeb : current.secureWeb))
         }
     }
 
-    private func turnOffOwnLeftovers(host: String, port: Int) async throws {
+    /// Trả về true nếu có dịch vụ nào thực sự bị đổi.
+    @discardableResult
+    private func turnOffOwnLeftovers(host: String, port: Int) async throws -> Bool {
+        var changedAny = false
         for service in try await configurer.activeServices() {
             let current = try await configurer.read(service: service)
             let web = current.web.pointsAt(host: host, port: port) ? ProxySetting.off : current.web
@@ -160,6 +175,8 @@ public actor SystemProxyController {
             guard web != current.web || secure != current.secureWeb else { continue }
             try await configurer.restore(
                 ServiceProxySnapshot(service: service, web: web, secureWeb: secure))
+            changedAny = true
         }
+        return changedAny
     }
 }

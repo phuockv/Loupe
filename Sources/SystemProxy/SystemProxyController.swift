@@ -64,17 +64,29 @@ public actor SystemProxyController {
         return applied
     }
 
-    /// Lùi lại những dịch vụ đã đặt trong CHÍNH lần gọi này, rồi bỏ snapshot.
+    /// Lùi lại những dịch vụ đã đặt trong CHÍNH lần gọi này, rồi bỏ snapshot
+    /// CHỈ KHI mọi lần restore đều thành công.
     ///
     /// Lỗi trong lúc lùi được nuốt có chủ ý: ta đang xử lý một lỗi khác và
     /// sắp ném nó lên trên; ném đè một lỗi thứ hai sẽ giấu mất nguyên nhân
-    /// đầu tiên, thứ người dùng cần để hiểu chuyện gì đã xảy ra.
+    /// đầu tiên, thứ người dùng cần để hiểu chuyện gì đã xảy ra. Nhưng nuốt
+    /// lỗi không có nghĩa lờ nó đi: nếu một restore hỏng, dịch vụ đó vẫn còn
+    /// trỏ vào ta, và file snapshot chính là đường về DUY NHẤT — xoá nó lúc
+    /// này là đúng lỗi mà cả tính năng sinh ra để tránh. Giữ file lại thì vô
+    /// hại (khôi phục là idempotent), xoá nhầm thì mất mạng.
     private func rollBack(_ applied: [String]) async {
         guard let snapshot = try? store.read() else { return }
+        var allRestored = true
         for service in applied {
             guard let original = snapshot.services.first(where: { $0.service == service }) else { continue }
-            try? await configurer.restore(original)
+            do {
+                try await configurer.restore(original)
+            } catch {
+                allRestored = false
+            }
         }
-        try? store.delete()
+        if allRestored {
+            try? store.delete()
+        }
     }
 }

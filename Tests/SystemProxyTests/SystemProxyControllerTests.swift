@@ -153,6 +153,22 @@ struct SystemProxyControllerTests {
         #expect(store.exists == false, "lùi xong thì không còn gì để khôi phục")
     }
 
+    @Test("Rollback mà restore cũng hỏng thì GIỮ LẠI snapshot, không xoá")
+    func keepsSnapshotWhenRollbackRestoreAlsoFails() async throws {
+        let store = tempStore()
+        // Hỏng ở lần apply thứ hai, và dịch vụ đầu tiên (đã apply xong) lại
+        // hỏng luôn lúc restore trong rollback.
+        let fake = FakeConfigurer(services: ["Wi-Fi", "Thunderbolt Bridge"],
+                                   failApplyAt: 2, failRestoreFor: "Wi-Fi")
+        let sut = SystemProxyController(configurer: fake, store: store)
+
+        await #expect(throws: SystemProxyError.self) {
+            _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+        }
+        #expect(store.exists == true,
+                "Wi-Fi vẫn trỏ vào ta mà restore hỏng — xoá file lúc này là mất đường về duy nhất")
+    }
+
     @Test("Bật lần hai khi snapshot đã tồn tại thì KHÔNG chụp đè")
     func doesNotOverwriteExistingSnapshot() async throws {
         let corporate = ServiceProxySnapshot(

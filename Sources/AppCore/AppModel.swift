@@ -84,7 +84,11 @@ public final class AppModel {
         installer: any TrustStoreInstaller = SecurityCommandInstaller(),
         store: TrafficStore = TrafficStore(),
         caDirectory: URL = CertificateAuthority.defaultDirectory,
-        systemProxy: SystemProxyController = SystemProxyController()
+        // `.shared`, KHÔNG phải một instance mới: `AppDelegate` chạy lần khôi
+        // phục lúc mở app trên đúng instance này, và cái chốt chặn `enable()`
+        // trong lúc đang khôi phục chỉ chặn được lời gọi trên cùng instance.
+        // Test vẫn tiêm controller cô lập của mình vào đây như cũ.
+        systemProxy: SystemProxyController = .shared
     ) {
         self.configuration = configuration
         self.installer = installer
@@ -170,13 +174,39 @@ public final class AppModel {
         } catch {
             // Đây là trạng thái có thể đang mất mạng, nên nó phải ồn và phải
             // kèm đúng lệnh người dùng gõ được để tự cứu.
-            statusMessage = """
-            GỠ PROXY HỆ THỐNG THẤT BẠI: \(error.localizedDescription)
-            Máy có thể đang không vào mạng được. Mở Terminal và chạy:
-            networksetup -setwebproxystate Wi-Fi off
-            networksetup -setsecurewebproxystate Wi-Fi off
-            """
+            statusMessage = Self.systemProxyRescueMessage(
+                error: error, services: await systemProxy.snapshotServices())
         }
+    }
+
+    /// Thông báo tự cứu khi gỡ proxy thất bại.
+    ///
+    /// Tên dịch vụ lấy từ chính snapshot, KHÔNG hard-code "Wi-Fi". Cả tính
+    /// năng này sinh ra vì dịch vụ chính thường KHÔNG phải Wi-Fi — sự cố gốc
+    /// là một VPN. Đưa cho một người đang mắc kẹt ngoài mạng hai câu lệnh
+    /// không sửa được gì còn tệ hơn là không đưa gì.
+    ///
+    /// Snapshot đọc không được thì không bịa tên: chỉ đường để họ tự liệt kê.
+    static func systemProxyRescueMessage(error: Error, services: [String]) -> String {
+        let commands: String
+        if services.isEmpty {
+            commands = """
+            networksetup -listallnetworkservices
+            rồi với TỪNG dịch vụ trong danh sách đó:
+            networksetup -setwebproxystate "<tên dịch vụ>" off
+            networksetup -setsecurewebproxystate "<tên dịch vụ>" off
+            """
+        } else {
+            commands = services.flatMap {
+                ["networksetup -setwebproxystate \"\($0)\" off",
+                 "networksetup -setsecurewebproxystate \"\($0)\" off"]
+            }.joined(separator: "\n")
+        }
+        return """
+        GỠ PROXY HỆ THỐNG THẤT BẠI: \(error.localizedDescription)
+        Máy có thể đang không vào mạng được. Mở Terminal và chạy:
+        \(commands)
+        """
     }
 
     /// Văn bản trạng thái sau khi bind thành công.

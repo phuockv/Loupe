@@ -89,4 +89,77 @@ public actor SystemProxyController {
             try? store.delete()
         }
     }
+
+    /// Trả mọi dịch vụ về trạng thái đã lưu, rồi xoá file.
+    ///
+    /// Xoá file CHỈ khi tất cả thành công. Hỏng cái nào thì giữ lại để lần mở
+    /// sau thử tiếp — xoá lúc chưa khôi phục xong là vứt mất bản đồ đường về.
+    public func disable() async throws {
+        guard let snapshot = try store.read() else { return }
+        try await restore(snapshot)
+        try store.delete()
+    }
+
+    /// Gọi lúc app khởi động. Trả về true nếu có dọn gì đó.
+    ///
+    /// File còn sót nghĩa là lần trước chết bất thường (SIGKILL, mất điện) —
+    /// không có cách nào chạy code sau SIGKILL, nên đây là đường về duy nhất.
+    ///
+    /// - Parameter fallbackPort: cổng dùng để nhận diện dấu vết của chính app
+    ///   khi file snapshot hỏng không đọc được `appliedPort` từ trong đó.
+    @discardableResult
+    public func recoverIfNeeded(fallbackPort: Int = 9090) async throws -> Bool {
+        guard store.exists else { return false }
+
+        let snapshot: ProxySnapshot
+        do {
+            guard let read = try store.read() else { return false }
+            snapshot = read
+        } catch {
+            // File hỏng: vẫn còn một đường cứu không cần tới nó. Dấu vết
+            // loopback đúng cổng ta chắc chắn do ta để lại, nên tắt nó an
+            // toàn kể cả khi không biết trạng thái gốc. Không đoán gì thêm
+            // ngoài phạm vi đó — proxy của người khác không bị đụng.
+            try await turnOffOwnLeftovers(host: "127.0.0.1", port: fallbackPort)
+            try store.delete()
+            return true
+        }
+
+        try await restore(snapshot)
+        try store.delete()
+        return true
+    }
+
+    /// Luật chung cho mọi đường khôi phục: chỉ đụng dịch vụ mà cấu hình HIỆN
+    /// TẠI vẫn đang trỏ vào ta.
+    ///
+    /// Không có luật này thì kịch bản sau làm hỏng việc thật: app crash →
+    /// người dùng mất mạng → họ tự đặt proxy công ty → mở lại app → app lẳng
+    /// lặng đạp mất cấu hình vừa đặt, viện cớ "khôi phục". Ý muốn mới của
+    /// người dùng phải thắng dấu vết cũ của ta.
+    ///
+    /// Luật này cũng làm việc khôi phục idempotent: chạy lại bao nhiêu lần
+    /// cũng không hại.
+    private func restore(_ snapshot: ProxySnapshot) async throws {
+        for original in snapshot.services {
+            let current = try await configurer.read(service: original.service)
+            let stillOurs =
+                current.web.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
+                || current.secureWeb.pointsAt(host: snapshot.appliedHost, port: snapshot.appliedPort)
+            guard stillOurs else { continue }
+            try await configurer.restore(original)
+        }
+    }
+
+    private func turnOffOwnLeftovers(host: String, port: Int) async throws {
+        for service in try await configurer.activeServices() {
+            let current = try await configurer.read(service: service)
+            let web = current.web.pointsAt(host: host, port: port) ? ProxySetting.off : current.web
+            let secure = current.secureWeb.pointsAt(host: host, port: port)
+                ? ProxySetting.off : current.secureWeb
+            guard web != current.web || secure != current.secureWeb else { continue }
+            try await configurer.restore(
+                ServiceProxySnapshot(service: service, web: web, secureWeb: secure))
+        }
+    }
 }

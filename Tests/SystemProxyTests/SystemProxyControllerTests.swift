@@ -72,6 +72,15 @@ struct SystemProxyControllerTests {
         var restored: [String] {
             events.compactMap { if case .restore(let s) = $0 { return s.service }; return nil }
         }
+
+        func clearEvents() { events.removeAll() }
+
+        func lastRestored(for service: String) -> ServiceProxySnapshot? {
+            events.reversed().compactMap {
+                if case .restore(let s) = $0, s.service == service { return s }
+                return nil
+            }.first
+        }
     }
 
     private func tempStore() -> ProxySnapshotStore {
@@ -195,6 +204,117 @@ struct SystemProxyControllerTests {
             _ = try await sut.enable(host: "127.0.0.1", port: 9090)
         }
         #expect(store.exists == false, "không đặt được gì thì đừng để lại file trống")
+    }
+
+    @Test("Gỡ thì trả mọi dịch vụ về trạng thái đã lưu rồi xoá file")
+    func disableRestoresEverythingThenDeletesFile() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi", "Thunderbolt Bridge"])
+        let sut = SystemProxyController(configurer: fake, store: store)
+        _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+
+        try await sut.disable()
+
+        #expect(await fake.restored == ["Wi-Fi", "Thunderbolt Bridge"])
+        #expect(store.exists == false)
+    }
+
+    @Test("Chỉ khôi phục dịch vụ CÒN đang trỏ vào ta; ai đã đổi đi thì để yên")
+    func skipsServicesChangedBySomeoneElse() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi", "Thunderbolt Bridge"])
+        let sut = SystemProxyController(configurer: fake, store: store)
+        _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+
+        // Người dùng tự đặt Wi-Fi sang proxy công ty trong lúc app đang chạy.
+        try await fake.restore(ServiceProxySnapshot(
+            service: "Wi-Fi",
+            web: ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128),
+            secureWeb: .off))
+        await fake.clearEvents()
+
+        try await sut.disable()
+
+        #expect(await fake.restored == ["Thunderbolt Bridge"],
+                "ý muốn mới của người dùng phải thắng dấu vết cũ của ta")
+    }
+
+    @Test("Nhận diện dấu vết dùng appliedPort trong snapshot, không dùng cổng hiện tại")
+    func usesAppliedPortFromSnapshotNotCurrentPort() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi"])
+        let sut = SystemProxyController(configurer: fake, store: store)
+        // Cấu hình cổng 0 → kernel cấp 54321 cho lần chạy này.
+        _ = try await sut.enable(host: "127.0.0.1", port: 54321)
+        await fake.clearEvents()
+
+        try await sut.disable()
+
+        #expect(await fake.restored == ["Wi-Fi"],
+                "đọc cổng ở chỗ khác ngoài snapshot là bỏ sót dịch vụ cần trả lại")
+    }
+
+    @Test("Khôi phục hỏng một dịch vụ thì GIỮ file lại để lần sau thử tiếp")
+    func keepsSnapshotWhenRestoreFails() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi", "Thunderbolt Bridge"],
+                                  failRestoreFor: "Thunderbolt Bridge")
+        let sut = SystemProxyController(configurer: fake, store: store)
+        _ = try await sut.enable(host: "127.0.0.1", port: 9090)
+
+        await #expect(throws: SystemProxyError.self) { try await sut.disable() }
+        #expect(store.exists, "xoá file lúc chưa khôi phục xong là vứt mất bản đồ đường về")
+    }
+
+    @Test("Mở app mà không có file sót thì KHÔNG chạy lệnh nào")
+    func recoverDoesNothingWithoutSnapshot() async throws {
+        let fake = FakeConfigurer(services: ["Wi-Fi"])
+        let sut = SystemProxyController(configurer: fake, store: tempStore())
+
+        #expect(try await sut.recoverIfNeeded() == false)
+        #expect(await fake.events.isEmpty, "app mở bình thường không được đụng vào cài đặt mạng")
+    }
+
+    @Test("File sót thì khôi phục rồi xoá")
+    func recoverRestoresLeftoverSnapshot() async throws {
+        let store = tempStore()
+        let fake = FakeConfigurer(services: ["Wi-Fi"])
+        let first = SystemProxyController(configurer: fake, store: store)
+        _ = try await first.enable(host: "127.0.0.1", port: 9090)
+        // Không gọi disable — giả lập app bị SIGKILL.
+
+        let afterRelaunch = SystemProxyController(configurer: fake, store: store)
+        #expect(try await afterRelaunch.recoverIfNeeded() == true)
+        #expect(store.exists == false)
+    }
+
+    @Test("JSON hỏng thì đi đường cứu: chỉ tắt dịch vụ đang trỏ vào ta")
+    func corruptSnapshotFallsBackToTurningOffOwnLeftovers() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("corrupt-\(UUID().uuidString)")
+            .appendingPathComponent("snapshot.json")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try Data("{ hỏng".utf8).write(to: url)
+
+        let ours = ServiceProxySnapshot(
+            service: "Wi-Fi",
+            web: ProxySetting(enabled: true, server: "127.0.0.1", port: 9090),
+            secureWeb: ProxySetting(enabled: true, server: "127.0.0.1", port: 9090))
+        let corporate = ServiceProxySnapshot(
+            service: "Thunderbolt Bridge",
+            web: ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128),
+            secureWeb: .off)
+        let fake = FakeConfigurer(services: ["Wi-Fi", "Thunderbolt Bridge"],
+                                  current: ["Wi-Fi": ours, "Thunderbolt Bridge": corporate])
+        let sut = SystemProxyController(configurer: fake,
+                                        store: ProxySnapshotStore(url: url))
+
+        _ = try await sut.recoverIfNeeded(fallbackPort: 9090)
+
+        #expect(await fake.restored == ["Wi-Fi"], "chỉ gỡ dấu vết chắc chắn của ta")
+        let restoredWiFi = await fake.lastRestored(for: "Wi-Fi")
+        #expect(restoredWiFi?.web.enabled == false)
     }
 }
 

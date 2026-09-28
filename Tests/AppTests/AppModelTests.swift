@@ -43,7 +43,7 @@ actor FakeSystemProxyConfigurer: SystemProxyConfiguring {
         case list
         case read(String)
         case apply(service: String, host: String, port: Int)
-        case restore(ServiceProxySnapshot)
+        case restore(service: String, field: ProxyField, setting: ProxySetting)
     }
 
     private(set) var events: [Event] = []
@@ -77,9 +77,15 @@ actor FakeSystemProxyConfigurer: SystemProxyConfiguring {
             secureWeb: ProxySetting(enabled: true, server: host, port: port))
     }
 
-    func restore(_ snapshot: ServiceProxySnapshot) async throws {
-        events.append(.restore(snapshot))
-        current[snapshot.service] = snapshot
+    func restore(_ setting: ProxySetting, field: ProxyField, of service: String) async throws {
+        events.append(.restore(service: service, field: field, setting: setting))
+        var snapshot = current[service]
+            ?? ServiceProxySnapshot(service: service, web: .off, secureWeb: .off)
+        switch field {
+        case .web: snapshot.web = setting
+        case .secureWeb: snapshot.secureWeb = setting
+        }
+        current[service] = snapshot
     }
 }
 
@@ -300,7 +306,7 @@ struct AppModelTests {
         await model.stop()
         let eventsAfterStop = await fake.events
         #expect(eventsAfterStop.contains { event in
-            if case .restore(let snapshot) = event { return snapshot.service == "Wi-Fi" }
+            if case .restore(service: "Wi-Fi", field: _, setting: _) = event { return true }
             return false
         })
     }

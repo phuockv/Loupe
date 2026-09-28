@@ -113,29 +113,41 @@ struct NetworkSetupConfigurerTests {
 
     @Test("Khôi phục về TẮT dùng -setwebproxystate off, KHÔNG set server rỗng port 0")
     func restoreToOffUsesStateCommand() async throws {
-        let fake = FakeRunner(outputs: ["", ""])
+        let fake = FakeRunner(outputs: [""])
         let sut = NetworkSetupConfigurer(runner: await fake.runner)
-        try await sut.restore(ServiceProxySnapshot(service: "Wi-Fi", web: .off, secureWeb: .off))
+        try await sut.restore(.off, field: .web, of: "Wi-Fi")
 
         let commands = await fake.commands
         #expect(commands == [
             ["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "off"],
-            ["/usr/sbin/networksetup", "-setsecurewebproxystate", "Wi-Fi", "off"],
         ], "`-setwebproxy Wi-Fi \"\" 0` là lệnh không hợp lệ, sẽ lỗi lúc chạy thật")
     }
 
     @Test("Khôi phục về một proxy đang bật thì set server rồi bật state")
     func restoreToEnabledSetsServerThenState() async throws {
-        let fake = FakeRunner(outputs: ["", "", "", ""])
+        let fake = FakeRunner(outputs: ["", ""])
         let sut = NetworkSetupConfigurer(runner: await fake.runner)
         let corporate = ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128)
-        try await sut.restore(ServiceProxySnapshot(service: "Wi-Fi", web: corporate, secureWeb: .off))
+        try await sut.restore(corporate, field: .web, of: "Wi-Fi")
 
         let commands = await fake.commands
         #expect(commands == [
             ["/usr/sbin/networksetup", "-setwebproxy", "Wi-Fi", "proxy.corp.local", "3128"],
             ["/usr/sbin/networksetup", "-setwebproxystate", "Wi-Fi", "on"],
-            ["/usr/sbin/networksetup", "-setsecurewebproxystate", "Wi-Fi", "off"],
         ])
+    }
+
+    @Test("Khôi phục một field KHÔNG phát lệnh nào cho field kia")
+    func restoreTouchesOnlyTheGivenField() async throws {
+        let fake = FakeRunner(outputs: ["", ""])
+        let sut = NetworkSetupConfigurer(runner: await fake.runner)
+        let corporate = ProxySetting(enabled: true, server: "proxy.corp.local", port: 3128)
+        try await sut.restore(corporate, field: .secureWeb, of: "Wi-Fi")
+
+        let commands = await fake.commands
+        #expect(commands == [
+            ["/usr/sbin/networksetup", "-setsecurewebproxy", "Wi-Fi", "proxy.corp.local", "3128"],
+            ["/usr/sbin/networksetup", "-setsecurewebproxystate", "Wi-Fi", "on"],
+        ], "một `-setwebproxy` thừa xoá sạch credential của proxy HTTP có xác thực")
     }
 }

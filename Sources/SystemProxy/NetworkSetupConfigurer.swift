@@ -87,26 +87,27 @@ public struct NetworkSetupConfigurer: SystemProxyConfiguring {
         _ = try await runner([Self.binary, "-setsecurewebproxy", service, host, String(port)])
     }
 
-    public func restore(_ snapshot: ServiceProxySnapshot) async throws {
-        try await restore(snapshot.web, service: snapshot.service,
-                          setCommand: "-setwebproxy", stateCommand: "-setwebproxystate")
-        try await restore(snapshot.secureWeb, service: snapshot.service,
-                          setCommand: "-setsecurewebproxy", stateCommand: "-setsecurewebproxystate")
-    }
-
     /// Trạng thái gốc TẮT thì chỉ gọi `...state off`.
     ///
     /// Không gọi `-setwebproxy <svc> "" 0`: server rỗng và cổng 0 là đối số
     /// không hợp lệ, `networksetup` sẽ báo lỗi. Đường khôi phục mà tự ném lỗi
     /// là đúng cái không được phép hỏng.
-    private func restore(_ setting: ProxySetting, service: String,
-                         setCommand: String, stateCommand: String) async throws {
+    ///
+    /// Đúng MỘT field mỗi lần gọi, và KHÔNG BAO GIỜ đụng field kia. Trước đây
+    /// hàm này phát lệnh cho cả hai field, kể cả field người dùng vừa tự đổi:
+    /// `-setwebproxy <svc> <host> <port>` không mang theo username/password
+    /// nên nó xoá sạch credential của một proxy có xác thực — và mỗi lệnh
+    /// thừa là thêm một chỗ hỏng được, đúng lúc đang cố cứu mạng cho họ.
+    /// Đường đồng bộ (`SyncProxyRestore`) vốn đã không đụng field kia; giờ
+    /// hai đường khớp nhau, nên kết quả không còn phụ thuộc app thoát kiểu gì.
+    public func restore(_ setting: ProxySetting, field: ProxyField, of service: String) async throws {
         guard setting.enabled else {
-            _ = try await runner([Self.binary, stateCommand, service, "off"])
+            _ = try await runner([Self.binary, field.stateCommand, service, "off"])
             return
         }
-        _ = try await runner([Self.binary, setCommand, service, setting.server, String(setting.port)])
-        _ = try await runner([Self.binary, stateCommand, service, "on"])
+        _ = try await runner(
+            [Self.binary, field.setCommand, service, setting.server, String(setting.port)])
+        _ = try await runner([Self.binary, field.stateCommand, service, "on"])
     }
 
     // MARK: - Chạy tiến trình thật

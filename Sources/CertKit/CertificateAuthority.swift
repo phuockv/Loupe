@@ -40,7 +40,7 @@ public struct CertificateAuthority: Sendable {
     public static var defaultDirectory: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ProxyManClone/ca", isDirectory: true)
+            .appendingPathComponent("Loupe/ca", isDirectory: true)
     }
 
     public static func loadOrCreate(in directory: URL) throws -> CertificateAuthority {
@@ -89,8 +89,8 @@ public struct CertificateAuthority: Sendable {
         let key = P256.Signing.PrivateKey()
         let certKey = Certificate.PrivateKey(key)
         let name = try DistinguishedName {
-            CommonName("ProxyManClone Root CA")
-            OrganizationName("ProxyManClone")
+            CommonName("Loupe Root CA")
+            OrganizationName("Loupe")
         }
         let now = Date()
         let certificate = try Certificate(

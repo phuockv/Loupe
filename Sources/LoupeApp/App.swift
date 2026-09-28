@@ -81,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct ProxyManCloneApp: App {
+struct LoupeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     init() {
@@ -93,7 +93,7 @@ struct ProxyManCloneApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("ProxyManClone") {
+        WindowGroup("Loupe") {
             ContentView()
                 .frame(minWidth: 1000, minHeight: 640)
         }

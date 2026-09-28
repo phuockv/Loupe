@@ -142,7 +142,7 @@ chứ không phải chi tiết hiện thực, nên nó thuộc về mục này.
 
 ### 3.2 Vị trí file snapshot
 
-`~/Library/Application Support/ProxyManClone/system-proxy-snapshot.json`
+`~/Library/Application Support/Loupe/system-proxy-snapshot.json`
 
 Cùng thư mục với `ca/`, nên không thêm chỗ mới nào để người dùng phải biết.
 

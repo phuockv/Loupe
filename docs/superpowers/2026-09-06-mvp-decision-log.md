@@ -1,4 +1,4 @@
-# Nhật ký quyết định — MVP ProxyManClone
+# Nhật ký quyết định — MVP Loupe
 
 Ngày: 2026-09-05 → 2026-09-06. Nhánh `feat/mvp`, 34 commit, 149 test.
 

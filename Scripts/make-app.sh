@@ -1,5 +1,5 @@
 #!/bin/bash
-# Đóng gói ProxyManCloneApp thành một .app bundle thật.
+# Đóng gói LoupeApp thành một .app bundle thật.
 #
 # Vì sao cần: `swift run` chạy binary trần, không nằm trong bundle. Một tiến
 # trình như vậy không có icon Dock, không vào được Cmd+Tab, và — quan trọng
@@ -11,8 +11,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 CONFIG="${1:-debug}"
-APP="ProxyManClone.app"
-BIN="ProxyManCloneApp"
+APP="Loupe.app"
+BIN="LoupeApp"
 
 swift build -c "$CONFIG" --product "$BIN"
 BUILT=$(swift build -c "$CONFIG" --product "$BIN" --show-bin-path)/"$BIN"
@@ -28,8 +28,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleExecutable</key><string>$BIN</string>
     <key>CFBundleIdentifier</key><string>com.proxymanclone.app</string>
-    <key>CFBundleName</key><string>ProxyManClone</string>
-    <key>CFBundleDisplayName</key><string>ProxyManClone</string>
+    <key>CFBundleName</key><string>Loupe</string>
+    <key>CFBundleDisplayName</key><string>Loupe</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>

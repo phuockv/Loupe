@@ -2,14 +2,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "ProxyManClone",
+    name: "Loupe",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "TrafficModel", targets: ["TrafficModel"]),
         .library(name: "CertKit", targets: ["CertKit"]),
         .library(name: "SystemProxy", targets: ["SystemProxy"]),
         .library(name: "ProxyCore", targets: ["ProxyCore"]),
-        .executable(name: "ProxyManCloneApp", targets: ["ProxyManCloneApp"]),
+        .executable(name: "LoupeApp", targets: ["LoupeApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
@@ -38,7 +38,7 @@ let package = Package(
         .target(name: "AppCore", dependencies: [
             "TrafficModel", "CertKit", "ProxyCore", "SystemProxy",
         ]),
-        .executableTarget(name: "ProxyManCloneApp", dependencies: [
+        .executableTarget(name: "LoupeApp", dependencies: [
             "AppCore",
         ]),
         .testTarget(name: "TrafficModelTests", dependencies: ["TrafficModel"]),

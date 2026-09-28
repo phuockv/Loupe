@@ -4,6 +4,7 @@
 *.xcuserstate
 xcuserdata/
 DerivedData/
-ProxyManClone.app/
-ProxyManClone.dmg
+Loupe.app/
+*.dmg
+*.zip
 .dmg-stage/

@@ -16,7 +16,7 @@ public struct ProxySnapshotStore: Sendable {
     public static var defaultURL: URL {
         FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ProxyManClone", isDirectory: true)
+            .appendingPathComponent("Loupe", isDirectory: true)
             .appendingPathComponent("system-proxy-snapshot.json")
     }
 
